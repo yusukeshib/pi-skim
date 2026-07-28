@@ -629,8 +629,14 @@ export function compactGrepOutput(
 	const groups = new Map<string, GrepGroup>();
 	const notices: string[] = [];
 	for (const line of exactOutput.split("\n")) {
-		const match = line.match(/^(.*):(\d+):\s?(.*)$/);
-		if (match?.[1] && match[2] && match[3] !== undefined) {
+		const match = line.match(/^(.+?):(\d+):\s?(.*)$/);
+		const context = line.match(/^(.+?)-(\d+)-\s?(.*)$/);
+		// With grep context, a context line may itself contain `path:line:` text.
+		// Only parse the colon delimiter when it appears before any context delimiter.
+		const isMatch =
+			match?.index !== undefined &&
+			(context?.index === undefined || line.indexOf(`-${context[2]}-`) > line.indexOf(`:${match[2]}:`));
+		if (isMatch && match?.[1] && match[2] && match[3] !== undefined) {
 			let group = groups.get(match[1]);
 			if (!group) {
 				group = { path: match[1], matchCount: 0, samples: [] };

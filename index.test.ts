@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createGrepToolDefinition, createReadToolDefinition } from "@earendil-works/pi-coding-agent";
-import extension from "./index.ts";
+import extension, { compactGrepOutput } from "./index.ts";
 
 const tools = new Map<string, any>();
 const hooks = new Map<string, any>();
@@ -500,6 +500,22 @@ test("oversized grep becomes a bounded cross-file index with exact output preser
 		if (exactPath) rmSync(path.dirname(exactPath), { recursive: true, force: true });
 		rmSync(dir, { recursive: true, force: true });
 	}
+});
+
+test("smart grep does not mistake context content containing path:line: for a file", () => {
+	const exact = [
+		'actual.ts-8- expect(saved).toContain("fake.ts:1: needle")',
+		"actual.ts:9: needle actual",
+		'other.ts-2- const sample = "phantom.rs:44: hit"',
+		"other.ts:3: needle other",
+	].join("\n");
+	const indexed = compactGrepOutput(exact, "/tmp/exact.txt");
+	expect(indexed.fileCount).toBe(2);
+	expect(indexed.matchCount).toBe(2);
+	expect(indexed.text).toContain("actual.ts (1)");
+	expect(indexed.text).toContain("other.ts (1)");
+	expect(indexed.text).not.toContain("fake.ts (1)");
+	expect(indexed.text).not.toContain("phantom.rs (1)");
 });
 
 test("smart grep falls back to exact when every matched file cannot fit in the index", async () => {
