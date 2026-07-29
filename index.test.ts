@@ -1,9 +1,9 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createGrepToolDefinition, createReadToolDefinition } from "@earendil-works/pi-coding-agent";
-import extension, { compactGrepOutput } from "./index.ts";
+import extension, { cleanupStaleArtifacts, compactGrepOutput } from "./index.ts";
 
 const tools = new Map<string, any>();
 const hooks = new Map<string, any>();
@@ -61,12 +61,13 @@ async function executeBuiltInGrep(cwd: string, input: Record<string, unknown>) {
 
 test("takes over read and grep without touching babysit or old AST tools", () => {
 	expect([...tools.keys()]).toEqual(["read", "grep"]);
-	expect(hooks.has("session_start")).toBe(false);
+	expect(hooks.has("session_start")).toBe(true);
 	expect(hooks.has("tool_call")).toBe(true);
 	expect(activeTools).toContain("ast_read_tree");
 	expect(activeTools).toContain("ast_read_symbol");
 	expect(tools.get("read").promptGuidelines.join(" ")).toContain("action=outline");
 	expect(tools.get("grep").promptGuidelines.join(" ")).not.toContain("babysit");
+	expect(tools.get("grep").promptGuidelines.join(" ")).toContain("never select it preemptively");
 });
 
 test("default and action=exact output are byte-for-byte built-in read behavior", async () => {
@@ -167,6 +168,68 @@ test("outline and qualified symbol preserve structural navigation", async () => 
 		expect(symbol.content[0].text).toContain("return 1");
 		expect(symbol.content[0].text).not.toContain("return 2");
 		expect(symbol.details).toBeUndefined();
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("Swift outline and qualified symbols preserve structural navigation", async () => {
+	const dir = tempDir();
+	try {
+		writeFileSync(
+			path.join(dir, "AppDelegate.swift"),
+			[
+				"@MainActor",
+				"final class AppDelegate: NSObject {",
+				"  @Published",
+				"  private var enabled = false",
+				"  @objc",
+				"  private func",
+				"    requestPermission() -> Bool { true }",
+				"  static func == (lhs: AppDelegate, rhs: AppDelegate) -> Bool { true }",
+				"}",
+				"struct Worker {",
+				"  func run() { class Local {} }",
+				"}",
+				"func outer() { class Nested {} }",
+				"func main() { print(\"ok\") }",
+			].join("\n"),
+		);
+		const outline = await executeRead(dir, { path: "AppDelegate.swift", action: "outline" });
+		expect(outline.content[0].text).toContain("AppDelegate");
+		expect(outline.content[0].text).toContain("requestPermission");
+		expect(outline.content[0].text).toContain("enabled");
+		expect(outline.content[0].text).toContain("static func ==");
+		expect(outline.content[0].text).not.toContain("class final");
+
+		const symbol = await executeRead(dir, {
+			path: "AppDelegate.swift",
+			action: "symbol",
+			symbol: "AppDelegate.requestPermission",
+		});
+		expect(symbol.content[0].text).toContain("requestPermission() -> Bool");
+		expect(symbol.content[0].text).not.toContain("func main");
+
+		const operator = await executeRead(dir, {
+			path: "AppDelegate.swift",
+			action: "symbol",
+			symbol: "AppDelegate.==",
+		});
+		expect(operator.content[0].text).toContain("static func ==");
+
+		const worker = await executeRead(dir, {
+			path: "AppDelegate.swift",
+			action: "symbol",
+			symbol: "Worker.run",
+		});
+		expect(worker.content[0].text).toContain("func run");
+
+		const outer = await executeRead(dir, {
+			path: "AppDelegate.swift",
+			action: "symbol",
+			symbol: "outer",
+		});
+		expect(outer.content[0].text).toContain("func outer");
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -277,7 +340,7 @@ test("focus is bounded but exact fallback still returns omitted content", async 
 			path: "large.txt",
 			action: "focus",
 			pattern: "needle",
-			context: 1,
+			context: 45,
 			maxMatches: 30,
 			maxBytes: 2_000,
 		});
@@ -518,13 +581,14 @@ test("smart grep does not mistake context content containing path:line: for a fi
 	expect(indexed.text).not.toContain("phantom.rs (1)");
 });
 
-test("smart grep falls back to exact when every matched file cannot fit in the index", async () => {
+test("smart grep stays bounded and links exact output when every matched file cannot fit", async () => {
 	const dir = tempDir();
+	let exactPath: string | undefined;
 	try {
 		for (let index = 0; index < 30; index++) {
 			writeFileSync(
 				path.join(dir, `very-long-matched-file-name-${String(index).padStart(3, "0")}-${"x".repeat(40)}.ts`),
-				`needle ${index}\n`,
+				`needle ${index} ${"y".repeat(300)}\n`,
 			);
 		}
 		const result = await executeGrep(dir, {
@@ -533,11 +597,45 @@ test("smart grep falls back to exact when every matched file cannot fit in the i
 			limit: 100,
 			maxBytes: 1_000,
 		});
-		expect(result.content[0].text).not.toContain("Smart grep index");
-		expect(Buffer.byteLength(result.content[0].text)).toBeGreaterThan(1_000);
-		expect(result.content[0].text).toContain("needle");
+		expect(Buffer.byteLength(result.content[0].text)).toBeLessThanOrEqual(1_000);
+		expect(result.content[0].text).toContain("Smart grep index omitted");
+		expect(result.content[0].text).toContain("Full exact grep result");
+		exactPath = result.content[0].text.match(/\[Full exact grep result: (.+)\]/)?.[1];
+		expect(exactPath).toBeTruthy();
+		expect(await Bun.file(exactPath!).text()).toContain("very-long-matched-file-name-029");
 	} finally {
+		if (exactPath) rmSync(path.dirname(exactPath), { recursive: true, force: true });
 		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("manifest overflow remains bounded when the exact-result path is too long", () => {
+	const exact = Array.from(
+		{ length: 30 },
+		(_, index) => `very-long-${index}.ts:${index + 1}: needle ${"x".repeat(300)}`,
+	).join("\n");
+	const result = compactGrepOutput(exact, `/tmp/${"nested/".repeat(200)}exact-output.txt`, 1_000);
+	expect(result.allFilesIndexed).toBe(false);
+	expect(Buffer.byteLength(result.text)).toBeLessThanOrEqual(1_000);
+	expect(result.text).toContain("exact-result path exceeds");
+});
+
+test("stale artifacts are removed without touching fresh or unrelated directories", async () => {
+	const root = tempDir();
+	try {
+		const stale = path.join(root, "pi-skim-grep-stale");
+		const fresh = path.join(root, "pi-skim-outline-fresh");
+		const unrelated = path.join(root, "other-tool-stale");
+		for (const dir of [stale, fresh, unrelated]) mkdirSync(dir);
+		const now = Date.now();
+		utimesSync(stale, (now - 20_000) / 1_000, (now - 20_000) / 1_000);
+		utimesSync(unrelated, (now - 20_000) / 1_000, (now - 20_000) / 1_000);
+		await cleanupStaleArtifacts(root, now, 10_000);
+		expect(existsSync(stale)).toBe(false);
+		expect(existsSync(fresh)).toBe(true);
+		expect(existsSync(unrelated)).toBe(true);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
 	}
 });
 

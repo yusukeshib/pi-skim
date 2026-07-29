@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, open, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, open, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
@@ -24,6 +24,8 @@ const MAX_OPTIMIZED_BYTES = 32_000;
 const MAX_SOURCE_BYTES = 64 * 1024 * 1024;
 const READ_NUDGE_BYTES = Number(process.env.PI_SKIM_NUDGE_BYTES) || 20_000;
 const DEFAULT_GREP_MAX_PER_FILE = 3;
+const ARTIFACT_TTL_MS = Number(process.env.PI_SKIM_ARTIFACT_TTL_MS) || 7 * 24 * 60 * 60 * 1_000;
+const ARTIFACT_PREFIXES = ["pi-skim-grep-", "pi-skim-outline-"];
 const readSchema = Type.Object({
 	path: Type.String({ description: "Path to the file to read (relative or absolute)" }),
 	offset: Type.Optional(Type.Number({ description: "Line number to start reading from (1-indexed)" })),
@@ -40,7 +42,7 @@ const readSchema = Type.Object({
 		Type.String({ description: "Regex for action=focus" }),
 	),
 	context: Type.Optional(
-		Type.Integer({ minimum: 0, maximum: 20, description: "Focus context lines (default: 2)" }),
+		Type.Integer({ minimum: 0, maximum: 50, description: "Focus context lines (default: 2)" }),
 	),
 	maxMatches: Type.Optional(
 		Type.Integer({ minimum: 1, maximum: 200, description: "Focus match cap (default: 30)" }),
@@ -68,7 +70,7 @@ const grepSchema = Type.Object({
 	limit: Type.Optional(Type.Number({ description: "Maximum matches returned by exact grep (default: 100)" })),
 	mode: Type.Optional(
 		StringEnum(["smart", "exact"] as const, {
-			description: "smart/default indexes >maxBytes; exact=pi grep",
+			description: "smart/default indexes oversized results; exact only for explicit exhaustive requests",
 		}),
 	),
 	maxBytes: Type.Optional(
@@ -145,6 +147,10 @@ const PYTHON: LanguageConfig = {
 	kinds: ["class_definition", "function_definition"],
 };
 const SHELL: LanguageConfig = { language: "bash", kinds: ["function_definition"] };
+const SWIFT: LanguageConfig = {
+	language: "swift",
+	kinds: ["class_declaration", "protocol_declaration", "function_declaration", "property_declaration"],
+};
 const LANGUAGES: Record<string, LanguageConfig> = {
 	rs: RUST,
 	ts: TYPESCRIPT,
@@ -161,9 +167,10 @@ const LANGUAGES: Record<string, LanguageConfig> = {
 	bash: SHELL,
 	zsh: SHELL,
 	ksh: SHELL,
+	swift: SWIFT,
 };
 const RESERVED = new Set(
-	"pub export default async unsafe const static abstract declare public private protected readonly fn function def class struct enum trait impl interface type mod let var get set".split(
+	"pub export default async unsafe const static abstract declare public private protected readonly fn function def class struct enum trait impl interface type mod let var get set final internal open fileprivate mutating nonmutating override convenience required indirect actor protocol extension func".split(
 		" ",
 	),
 );
@@ -195,8 +202,22 @@ function stripRustVisibility(text: string): string {
 	return text.replace(/\bpub\s*\([^)]*\)/g, "pub");
 }
 
-function symbolName(firstLine: string): string {
-	const normalized = stripRustVisibility(firstLine).replace(/<[^>]*>/g, " ");
+function symbolName(declaration: string): string {
+	const withoutAttributes = stripRustVisibility(declaration).replace(
+		/@[A-Za-z_]\w*(?:\([^)]*\))?/g,
+		" ",
+	);
+	const swiftType = withoutAttributes.match(
+		/\b(?:class|struct|enum|protocol|actor|extension)\s+([A-Za-z_]\w*)/,
+	)?.[1];
+	if (swiftType) return swiftType;
+	const swiftFunction = withoutAttributes.match(
+		/\bfunc\s+([A-Za-z_]\w*|[+\-*/%=<>!&|^~?.]+)/,
+	)?.[1];
+	if (swiftFunction) return swiftFunction;
+	const swiftProperty = withoutAttributes.match(/\b(?:var|let)\s+([A-Za-z_]\w*)/)?.[1];
+	if (swiftProperty) return swiftProperty;
+	const normalized = withoutAttributes.replace(/<[^>]*>/g, " ");
 	if (/^\s*(pub\s+)?(unsafe\s+)?impl\b/.test(normalized)) {
 		const forMatch = normalized.match(/\bfor\s+([A-Za-z_][\w:]*)/)?.[1];
 		if (forMatch) return forMatch.split("::").at(-1) ?? forMatch;
@@ -274,7 +295,10 @@ async function astGrepSymbols(
 			range: { start: { line: number }; end: { line: number } };
 		}>
 	).map((match) => {
-		const declaration = match.text.split("\n", 1)[0] ?? "";
+		const lines = match.text.split("\n");
+		const declaration = config.language === "swift"
+			? (match.text.split("{", 1)[0] ?? match.text).replace(/\s+/g, " ").trim()
+			: lines.find((line) => symbolName(line) !== "?") ?? lines[0] ?? "";
 		return {
 			name: symbolName(declaration),
 			signature: symbolSignature(declaration),
@@ -337,12 +361,41 @@ export async function symbolsFor(filePath: string, signal?: AbortSignal): Promis
 	const detected = await detectSource(filePath);
 	if (!detected) {
 		throw new Error(
-			"Unsupported source. read action=outline/symbol supports Rust, TypeScript/TSX, JavaScript/JSX, Python, Shell, and Makefiles. Use exact read otherwise.",
+			"Unsupported source. read action=outline/symbol supports Rust, TypeScript/TSX, JavaScript/JSX, Python, Shell, Swift, and Makefiles. Use exact read otherwise.",
 		);
 	}
 	return detected.type === "makefile"
 		? makefileSymbols(filePath)
 		: astGrepSymbols(filePath, detected.config, signal);
+}
+
+export async function cleanupStaleArtifacts(
+	rootDir = tmpdir(),
+	now = Date.now(),
+	ttlMs = ARTIFACT_TTL_MS,
+): Promise<void> {
+	let entries;
+	try {
+		entries = await readdir(rootDir, { withFileTypes: true });
+	} catch {
+		return;
+	}
+	await Promise.all(
+		entries
+			.filter(
+				(entry) => entry.isDirectory() && ARTIFACT_PREFIXES.some((prefix) => entry.name.startsWith(prefix)),
+			)
+			.map(async (entry) => {
+				const artifactDir = path.join(rootDir, entry.name);
+				try {
+					if (now - (await stat(artifactDir)).mtimeMs > ttlMs) {
+						await rm(artifactDir, { recursive: true, force: true });
+					}
+				} catch {
+					// Cleanup is best-effort and must never affect tool execution.
+				}
+			}),
+	);
 }
 
 function boundedText(body: string, maxBytes: number, continuation: string): BoundedText {
@@ -677,12 +730,33 @@ export function compactGrepOutput(
 	}
 	if (groups.size === 0) bodyLines.push(exactOutput.slice(0, 1_000));
 	const fitted = fitPlainLines(bodyLines, bodyBudget);
+	const allFilesIndexed = footerFits && groups.size > 0 && fitted.shown >= 1 + groups.size;
+	if (!allFilesIndexed) {
+		let overflowText = [
+			`[Smart grep index omitted: ${matchCount} returned matches across ${groups.size} files; the complete file list exceeds the ${formatSize(maxBytes)} response budget.]`,
+			`[Full exact grep result: ${fullOutputPath}]`,
+			"[Read that path for the complete original result. Use mode=exact only for an explicit exhaustive request.]",
+		].join("\n");
+		if (byteLength(overflowText) > maxBytes) {
+			overflowText = [
+				`[Smart grep index omitted: ${matchCount} returned matches across ${groups.size} files; the response budget is ${formatSize(maxBytes)}.]`,
+				"[The exact-result path exceeds the response budget. Re-run this grep with mode=exact only for an explicit exhaustive request.]",
+			].join("\n");
+		}
+		return {
+			text: overflowText,
+			matchCount,
+			fileCount: groups.size,
+			allFilesIndexed: false,
+			indexTruncated: true,
+		};
+	}
 	const text = `${fitted.text}\n\n${footer}`;
 	return {
 		text,
 		matchCount,
 		fileCount: groups.size,
-		allFilesIndexed: footerFits && groups.size > 0 && fitted.shown >= 1 + groups.size,
+		allFilesIndexed,
 		indexTruncated: fitted.shown < bodyLines.length,
 	};
 }
@@ -700,7 +774,7 @@ export default function extension(pi: ExtensionAPI): void {
 			"For large source files, action=outline returns signatures and line ranges; action=symbol returns one named symbol; action=focus returns bounded regex windows.",
 		promptSnippet: "Read files exactly, or outline/focus large source files and read one symbol",
 		promptGuidelines: [
-			"Use read action=outline before exact-reading a large supported Rust/TypeScript/JavaScript/Python/Shell file or Makefile, then read action=symbol for the relevant declaration.",
+			"Use read action=outline before exact-reading a large supported Rust/TypeScript/JavaScript/Python/Shell/Swift file or Makefile, then read action=symbol for the relevant declaration.",
 			"Use read action=focus for bounded regex windows in one text file; use exact read when exhaustive verbatim content is required.",
 		],
 		parameters: readSchema,
@@ -724,11 +798,11 @@ export default function extension(pi: ExtensionAPI): void {
 		name: "grep",
 		label: "grep",
 		description:
-			`Search using pi's grep. Results up to ${formatSize(DEFAULT_OPTIMIZED_BYTES)} stay exact; larger output becomes a cross-file index linked to the exact result. mode=exact disables indexing.`,
+			`Search using pi's grep. Results up to ${formatSize(DEFAULT_OPTIMIZED_BYTES)} stay exact; larger output becomes a bounded index linked to the exact result. Leave mode unset for discovery; mode=exact is only for explicit exhaustive requests.`,
 		promptSnippet: "Search code; oversized results become a bounded index with full exact output preserved",
 		promptGuidelines: [
 			"Use grep with context=0 for initial discovery, then read action=symbol, action=focus, or exact offset/limit for relevant files.",
-			"Use grep mode=exact, or read the full exact result path from a smart grep index, when every returned context line is required.",
+			"Leave grep mode unset for discovery. Use mode=exact only when the user explicitly requires exhaustive original context or after a smart result proves insufficient; never select it preemptively.",
 		],
 		parameters: grepSchema,
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
@@ -763,10 +837,6 @@ export default function extension(pi: ExtensionAPI): void {
 					maxBytes,
 					params.maxPerFile ?? DEFAULT_GREP_MAX_PER_FILE,
 				);
-				if (!indexed.allFilesIndexed) {
-					await rm(outputDir, { recursive: true, force: true });
-					return exact;
-				}
 				await writeFile(fullOutputPath, content.text, "utf8");
 				return {
 					content: [{ type: "text" as const, text: indexed.text }],
@@ -778,6 +848,10 @@ export default function extension(pi: ExtensionAPI): void {
 				return exact;
 			}
 		},
+	});
+
+	pi.on("session_start", async () => {
+		await cleanupStaleArtifacts();
 	});
 
 	if (process.env.PI_SKIM_NUDGE === "0") return;

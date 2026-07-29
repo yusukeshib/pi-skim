@@ -10,8 +10,9 @@ The extension never automatically summarizes or deletes an executed exact result
 
 - `read` with no `action`, or with `action=exact`, delegates unchanged to pi's built-in read implementation.
 - Large whole-source reads receive a **one-time nudge** toward an outline/symbol. Explicit ranges always remain exact. Repeating the whole-file call bypasses the nudge.
-- Grep results up to 8KB delegate unchanged to pi's built-in grep. Larger results become a file index only when every returned file path fits; the byte-for-byte exact result is saved and linked, and `mode=exact` bypasses indexing.
-- Optimized output always has an explicit byte budget and points to exact fallback when truncated.
+- Grep results up to 8KB delegate unchanged to pi's built-in grep. Larger results become a bounded file index with the byte-for-byte exact result saved and linked. If every file path cannot fit, the bounded response links the exact result instead of failing open to a large payload.
+- `mode=exact` bypasses indexing and is intended only for explicit exhaustive requests or after a smart result proves insufficient.
+- Optimized output always honors its explicit byte budget and points to exact fallback when truncated.
 - Unsupported AST languages fail clearly; exact read remains available.
 
 This is progressive disclosure, not lossy post-processing.
@@ -35,8 +36,8 @@ After removing the old `pi-ast-read` package, its two schemas are replaced by th
 | Call | Behavior |
 |---|---|
 | `grep({ pattern, ... })` | Exact built-in result when ≤8KB; otherwise bounded file index plus exact-output path |
-| `grep({ pattern, mode: "exact", ... })` | Exact pi built-in grep result |
-| `grep({ pattern, maxBytes, maxPerFile, ... })` | Configure smart-index budget and representative matches; activation remains fixed at 8KB |
+| `grep({ pattern, mode: "exact", ... })` | Exact pi built-in grep result for an explicitly exhaustive request |
+| `grep({ pattern, maxBytes, maxPerFile, ... })` | Configure smart-index budget and representative matches; activation remains fixed at 8KB. If the file manifest cannot fit, returns a bounded exact-result link |
 
 ## Why
 
@@ -107,6 +108,7 @@ Backed by [`ast-grep`](https://ast-grep.github.io/):
 - JavaScript / JSX
 - Python
 - Shell
+- Swift
 - Makefiles (built-in parser)
 
 ```sh
@@ -123,12 +125,15 @@ Read nudges:
 
 Explicit and open-ended ranges are never nudged. Every whole-file nudge is keyed by the exact request and fires once per session. Repeating the same call runs unchanged. Grep does not use a blocking nudge: it executes once and indexes only when the exact result exceeds 8KB.
 
+Exact grep and detailed-outline artifacts are retained for seven days so resumed sessions can follow their links. Cleanup is best-effort on session start and never affects tool execution.
+
 Environment variables:
 
 | Variable | Meaning |
 |---|---|
 | `PI_SKIM_NUDGE=0` | Disable read nudges |
 | `PI_SKIM_NUDGE_BYTES` | Whole-source threshold |
+| `PI_SKIM_ARTIFACT_TTL_MS` | Exact grep and detailed-outline artifact retention (default: 7 days) |
 
 ## Install
 
@@ -152,4 +157,4 @@ npm install
 npm run check
 ```
 
-The test suite verifies exact built-in read/grep parity, one-time read bypass behavior, AST navigation, bounded grep indexing, byte-for-byte exact-result preservation, and that pi-babysit calls are untouched.
+The test suite verifies exact built-in read/grep parity, one-time read bypass behavior, AST navigation (including Swift), bounded grep indexing and manifest overflow, byte-for-byte exact-result preservation, stale artifact cleanup, and that pi-babysit calls are untouched.
