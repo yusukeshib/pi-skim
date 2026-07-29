@@ -265,6 +265,44 @@ test("oversized outline keeps every symbol name and links detailed signatures", 
 	}
 });
 
+test("outline stays bounded when even the complete symbol index exceeds the budget", async () => {
+	const dir = tempDir();
+	let symbolIndexPath: string | undefined;
+	let detailedPath: string | undefined;
+	try {
+		const fileName = `${"巨大な索引".repeat(8)}.ts`;
+		writeFileSync(
+			path.join(dir, fileName),
+			Array.from(
+				{ length: 500 },
+				(_, index) =>
+					`function very_long_symbol_name_${String(index).padStart(3, "0")}(${"argument: string, ".repeat(8)}last: string) { return ${index}; }`,
+			).join("\n"),
+		);
+		const result = await executeRead(dir, {
+			path: fileName,
+			action: "outline",
+			maxBytes: 1_000,
+		});
+		const output = result.content[0].text;
+		expect(Buffer.byteLength(output, "utf8")).toBeLessThanOrEqual(1_000);
+		expect(output).not.toContain("�");
+		expect(output).toContain("very_long_symbol_name_000");
+		expect(output).not.toContain("very_long_symbol_name_499");
+		symbolIndexPath = output.match(/\[Full symbol index: (.+)\]/)?.[1];
+		detailedPath = output.match(/\[Detailed signatures: (.+)\]/)?.[1];
+		expect(symbolIndexPath).toBeTruthy();
+		expect(detailedPath).toBeTruthy();
+		expect(await Bun.file(symbolIndexPath!).text()).toContain("very_long_symbol_name_499");
+		expect(await Bun.file(detailedPath!).text()).toContain("argument: string");
+		expect(result.details?.truncation?.truncated).toBe(true);
+	} finally {
+		const artifactPath = symbolIndexPath ?? detailedPath;
+		if (artifactPath) rmSync(path.dirname(artifactPath), { recursive: true, force: true });
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
 test("missing symbol reports available names without selecting unrelated source", async () => {
 	const dir = tempDir();
 	try {

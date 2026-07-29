@@ -84,7 +84,7 @@ In the same-day replay, 180 broad grep calls produced 2.15MB. An 8KB smart-resul
 }
 ```
 
-If detailed signatures exceed the outline budget, the compact view still includes every symbol name and range and links the full detailed outline. If even all names cannot fit, pi-skim returns the full outline rather than hiding symbols.
+If detailed signatures exceed the outline budget, pi-skim saves both the full symbol index and detailed outline as artifacts. The bounded response includes every symbol name and range when they fit; otherwise it shows the largest fitting prefix and links both complete artifacts. Outline responses never exceed their explicit byte budget.
 
 ### Focused windows
 

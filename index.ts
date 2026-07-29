@@ -399,14 +399,26 @@ export async function cleanupStaleArtifacts(
 }
 
 function boundedText(body: string, maxBytes: number, continuation: string): BoundedText {
-	const reserve = Math.min(byteLength(continuation) + 2, Math.floor(maxBytes / 3));
+	const separator = "\n\n";
+	const continuationBytes = byteLength(separator) + byteLength(continuation);
+	if (continuationBytes >= maxBytes) {
+		const truncation = truncateHead(continuation, {
+			maxBytes,
+			maxLines: DEFAULT_MAX_LINES,
+		});
+		return {
+			text: truncation.content,
+			details: { truncation },
+			truncated: true,
+		};
+	}
 	const truncation = truncateHead(body, {
-		maxBytes: Math.max(1, maxBytes - reserve),
+		maxBytes: maxBytes - continuationBytes,
 		maxLines: DEFAULT_MAX_LINES,
 	});
 	if (!truncation.truncated) return { text: body, details: undefined, truncated: false };
 	return {
-		text: `${truncation.content}\n\n${continuation}`,
+		text: `${truncation.content}${separator}${continuation}`,
 		details: { truncation },
 		truncated: true,
 	};
@@ -485,37 +497,52 @@ async function optimizedRead(
 		let outputDir: string | undefined;
 		try {
 			outputDir = await mkdtemp(path.join(tmpdir(), "pi-skim-outline-"));
-			const fullOutputPath = path.join(outputDir, "detailed-outline.txt");
-			const footer =
-				`[Detailed signatures: ${fullOutputPath}]\n` +
-				"[All symbol names and ranges are shown below; use read action=symbol or exact line ranges.]";
-			const compact =
+			const detailedPath = path.join(outputDir, "detailed-outline.txt");
+			const symbolIndexPath = path.join(outputDir, "symbol-index.txt");
+			const symbolIndex =
 				`Symbol index: ${params.path} (${symbols.length} symbols)\n` +
 				symbols
 					.map(
 						(symbol) =>
 							`${"  ".repeat(symbol.depth)}${symbol.name}  [${symbol.start}-${symbol.end}]`,
 					)
-					.join("\n") +
-				`\n${footer}`;
-			if (byteLength(compact) > maxBytes) {
-				await rm(outputDir, { recursive: true, force: true });
-				// Never hide symbol names merely to satisfy an optimization budget.
-				return { content: [{ type: "text", text: detailed }], details: undefined };
+					.join("\n");
+			const footer =
+				`[Full symbol index: ${symbolIndexPath}]\n` +
+				`[Detailed signatures: ${detailedPath}]\n` +
+				"[Use read action=symbol or exact line ranges for source.]";
+			await Promise.all([
+				writeFile(detailedPath, detailed, "utf8"),
+				writeFile(symbolIndexPath, symbolIndex, "utf8"),
+			]);
+			const compact = `${symbolIndex}\n${footer}`;
+			if (byteLength(compact) <= maxBytes) {
+				return {
+					content: [{ type: "text", text: compact }],
+					details: {
+						truncation: truncateHead(detailed, {
+							maxBytes,
+							maxLines: DEFAULT_MAX_LINES,
+						}),
+					},
+				};
 			}
-			await writeFile(fullOutputPath, detailed, "utf8");
+			const bounded = boundedText(symbolIndex, maxBytes, footer);
 			return {
-				content: [{ type: "text", text: compact }],
-				details: {
-					truncation: truncateHead(detailed, {
-						maxBytes,
-						maxLines: DEFAULT_MAX_LINES,
-					}),
-				},
+				content: [{ type: "text", text: bounded.text }],
+				details: bounded.details,
 			};
 		} catch {
 			if (outputDir) await rm(outputDir, { recursive: true, force: true }).catch(() => {});
-			return { content: [{ type: "text", text: detailed }], details: undefined };
+			const bounded = boundedText(
+				detailed,
+				maxBytes,
+				"[Outline artifact unavailable; use read action=symbol or exact line ranges.]",
+			);
+			return {
+				content: [{ type: "text", text: bounded.text }],
+				details: bounded.details,
+			};
 		}
 	}
 
