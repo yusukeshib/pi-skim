@@ -36,13 +36,15 @@ const readSchema = Type.Object({
 		}),
 	),
 	symbol: Type.Optional(
-		Type.String({ description: "Name for action=symbol; supports Parent.child" }),
+		Type.String({
+			description: "Name for action=symbol; supports Parent.child, Parent::child, or an exact candidate signature",
+		}),
 	),
 	pattern: Type.Optional(
 		Type.String({ description: "Regex for action=focus" }),
 	),
 	context: Type.Optional(
-		Type.Integer({ minimum: 0, maximum: 50, description: "Focus context lines (default: 2)" }),
+		Type.Integer({ minimum: 0, maximum: 500, description: "Focus context lines (default: 2)" }),
 	),
 	maxMatches: Type.Optional(
 		Type.Integer({ minimum: 1, maximum: 200, description: "Focus match cap (default: 30)" }),
@@ -115,15 +117,18 @@ interface BoundedText {
 	truncated: boolean;
 }
 
-const TS_KINDS = [
+const JAVASCRIPT_KINDS = [
 	"class_declaration",
-	"abstract_class_declaration",
 	"function_declaration",
+	"method_definition",
+	"lexical_declaration",
+];
+const TYPESCRIPT_KINDS = [
+	...JAVASCRIPT_KINDS,
+	"abstract_class_declaration",
 	"interface_declaration",
 	"type_alias_declaration",
 	"enum_declaration",
-	"method_definition",
-	"lexical_declaration",
 ];
 const RUST: LanguageConfig = {
 	language: "rust",
@@ -140,8 +145,8 @@ const RUST: LanguageConfig = {
 		"macro_definition",
 	],
 };
-const TYPESCRIPT: LanguageConfig = { language: "typescript", kinds: TS_KINDS };
-const JAVASCRIPT: LanguageConfig = { language: "javascript", kinds: TS_KINDS };
+const TYPESCRIPT: LanguageConfig = { language: "typescript", kinds: TYPESCRIPT_KINDS };
+const JAVASCRIPT: LanguageConfig = { language: "javascript", kinds: JAVASCRIPT_KINDS };
 const PYTHON: LanguageConfig = {
 	language: "python",
 	kinds: ["class_definition", "function_definition"],
@@ -154,7 +159,7 @@ const SWIFT: LanguageConfig = {
 const LANGUAGES: Record<string, LanguageConfig> = {
 	rs: RUST,
 	ts: TYPESCRIPT,
-	tsx: { language: "tsx", kinds: TS_KINDS },
+	tsx: { language: "tsx", kinds: TYPESCRIPT_KINDS },
 	js: JAVASCRIPT,
 	jsx: JAVASCRIPT,
 	mts: TYPESCRIPT,
@@ -469,6 +474,36 @@ function containingParent(symbol: SymbolInfo, symbols: SymbolInfo[]): SymbolInfo
 		.sort((left, right) => left.end - left.start - (right.end - right.start))[0];
 }
 
+function splitSymbolSelector(selector: string): { target: string; parent?: string } {
+	const dot = selector.lastIndexOf(".");
+	const path = selector.lastIndexOf("::");
+	const separator = Math.max(dot, path);
+	if (separator < 0) return { target: selector };
+	const width = separator === path ? 2 : 1;
+	return {
+		parent: selector.slice(0, separator),
+		target: selector.slice(separator + width),
+	};
+}
+
+function explicitSignature(selector: string): string | undefined {
+	const candidate = selector.includes(": ") ? selector.slice(selector.indexOf(": ") + 2) : selector;
+	return /^(?:pub\s+)?(?:impl|struct|enum|trait|fn|type|const|static|class|interface|protocol|actor|extension|func|var|let)\b/.test(
+		candidate,
+	)
+		? candidate
+		: undefined;
+}
+
+function preferredDeclaration(hits: SymbolInfo[]): SymbolInfo | undefined {
+	const declarations = hits.filter(
+		(symbol) =>
+			!/\bimpl\b/.test(symbol.signature) &&
+			/\b(?:struct|enum|trait|class|interface|protocol|actor)\b/.test(symbol.signature),
+	);
+	return declarations.length === 1 ? declarations[0] : undefined;
+}
+
 async function optimizedRead(
 	params: SmartReadInput,
 	absolutePath: string,
@@ -549,18 +584,25 @@ async function optimizedRead(
 	if (action === "symbol") {
 		if (!params.symbol) throw new Error("`symbol` is required for read action=symbol");
 		const symbols = await symbolsFor(absolutePath, signal);
-		const parts = params.symbol.split(".");
-		const target = parts.at(-1) ?? params.symbol;
-		const parentName = parts.length > 1 ? parts.at(-2) : undefined;
-		let hits = symbols.filter((symbol) => symbol.name === target);
-		if (parentName) {
-			const parents = symbols.filter((symbol) => symbol.name === parentName);
+		const signature = explicitSignature(params.symbol);
+		const selector = splitSymbolSelector(params.symbol);
+		let hits = signature
+			? symbols.filter((symbol) => symbol.signature === signature)
+			: symbols.filter((symbol) => symbol.name === selector.target);
+		if (!signature && selector.parent) {
+			const parents = symbols.filter(
+				(symbol) => symbol.name === selector.parent || symbol.signature === selector.parent,
+			);
 			hits = hits.filter((hit) =>
 				parents.some(
 					(parent) =>
 						parent !== hit && parent.start <= hit.start && hit.end <= parent.end,
 				),
 			);
+		}
+		if (!signature && !selector.parent && hits.length > 1) {
+			const preferred = preferredDeclaration(hits);
+			if (preferred) hits = [preferred];
 		}
 		if (hits.length !== 1) {
 			const candidates = hits.length > 1 ? hits : symbols;
@@ -576,7 +618,7 @@ async function optimizedRead(
 			const bounded = boundedText(
 				body,
 				maxBytes,
-				`[Candidate list bounded. Use read action=outline or exact read by line range.]`,
+				`[Candidate list bounded. Retry with an exact candidate signature, use read action=outline, or read an exact line range.]`,
 			);
 			return { content: [{ type: "text", text: bounded.text }], details: bounded.details };
 		}
@@ -688,6 +730,28 @@ export interface SmartGrepIndex {
 	indexTruncated: boolean;
 }
 
+interface GrepParseOptions {
+	pattern: string;
+	literal?: boolean;
+	ignoreCase?: boolean;
+}
+
+function grepContentMatcher(options?: GrepParseOptions): ((text: string) => boolean) | undefined {
+	if (!options) return undefined;
+	try {
+		const pattern = options.literal
+			? options.pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+			: options.pattern;
+		const regex = new RegExp(pattern, options.ignoreCase ? "i" : "");
+		return (text) => {
+			regex.lastIndex = 0;
+			return regex.test(text);
+		};
+	} catch {
+		return undefined;
+	}
+}
+
 function fitPlainLines(lines: string[], maxBytes: number): { text: string; shown: number } {
 	const selected: string[] = [];
 	let bytes = 0;
@@ -705,17 +769,23 @@ export function compactGrepOutput(
 	fullOutputPath: string,
 	maxBytes = DEFAULT_OPTIMIZED_BYTES,
 	maxPerFile = DEFAULT_GREP_MAX_PER_FILE,
+	parseOptions?: GrepParseOptions,
 ): SmartGrepIndex {
 	const groups = new Map<string, GrepGroup>();
 	const notices: string[] = [];
+	const matchesPattern = grepContentMatcher(parseOptions);
 	for (const line of exactOutput.split("\n")) {
 		const match = line.match(/^(.+?):(\d+):\s?(.*)$/);
 		const context = line.match(/^(.+?)-(\d+)-\s?(.*)$/);
-		// With grep context, a context line may itself contain `path:line:` text.
-		// Only parse the colon delimiter when it appears before any context delimiter.
+		// With grep context, a context line may itself contain `path:line:` text, while a real
+		// match path may contain `-number-`. Query matching disambiguates those two shapes.
+		const contextDelimiterPrecedesMatch =
+			match?.[2] !== undefined &&
+			context?.[2] !== undefined &&
+			line.indexOf(`-${context[2]}-`) < line.indexOf(`:${match[2]}:`);
 		const isMatch =
 			match?.index !== undefined &&
-			(context?.index === undefined || line.indexOf(`-${context[2]}-`) > line.indexOf(`:${match[2]}:`));
+			(!contextDelimiterPrecedesMatch || matchesPattern?.(match[3] ?? "") === true);
 		if (isMatch && match?.[1] && match[2] && match[3] !== undefined) {
 			let group = groups.get(match[1]);
 			if (!group) {
@@ -802,6 +872,7 @@ export default function extension(pi: ExtensionAPI): void {
 		promptSnippet: "Read files exactly, or outline/focus large source files and read one symbol",
 		promptGuidelines: [
 			"Use read action=outline before exact-reading a large supported Rust/TypeScript/JavaScript/Python/Shell/Swift file or Makefile, then read action=symbol for the relevant declaration.",
+			"If a symbol has multiple candidates, retry with Parent.child, Parent::child, or an exact candidate signature such as impl Widget.",
 			"Use read action=focus for bounded regex windows in one text file; use exact read when exhaustive verbatim content is required.",
 		],
 		parameters: readSchema,
@@ -863,6 +934,11 @@ export default function extension(pi: ExtensionAPI): void {
 					fullOutputPath,
 					maxBytes,
 					params.maxPerFile ?? DEFAULT_GREP_MAX_PER_FILE,
+					{
+						pattern: params.pattern,
+						literal: params.literal,
+						ignoreCase: params.ignoreCase,
+					},
 				);
 				await writeFile(fullOutputPath, content.text, "utf8");
 				return {

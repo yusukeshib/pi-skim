@@ -173,6 +173,40 @@ test("outline and qualified symbol preserve structural navigation", async () => 
 	}
 });
 
+test("JavaScript and JSX outlines use grammar-valid symbol kinds", async () => {
+	const dir = tempDir();
+	try {
+		writeFileSync(
+			path.join(dir, "sample.js"),
+			[
+				"export class Worker {",
+				"  run() { return 1; }",
+				"}",
+				"export function helper() { return 2; }",
+			].join("\n"),
+		);
+		writeFileSync(
+			path.join(dir, "view.jsx"),
+			"export function View() { return <div>ok</div>; }\n",
+		);
+
+		const javascript = await executeRead(dir, { path: "sample.js", action: "outline" });
+		expect(javascript.content[0].text).toContain("class Worker");
+		expect(javascript.content[0].text).toContain("function helper");
+		const symbol = await executeRead(dir, {
+			path: "sample.js",
+			action: "symbol",
+			symbol: "Worker.run",
+		});
+		expect(symbol.content[0].text).toContain("return 1");
+
+		const jsx = await executeRead(dir, { path: "view.jsx", action: "outline" });
+		expect(jsx.content[0].text).toContain("function View");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
 test("Swift outline and qualified symbols preserve structural navigation", async () => {
 	const dir = tempDir();
 	try {
@@ -348,6 +382,47 @@ test("ambiguous symbols list candidates instead of silently choosing one", async
 	}
 });
 
+test("Rust type declarations are preferred and exact signatures disambiguate impls", async () => {
+	const dir = tempDir();
+	try {
+		writeFileSync(
+			path.join(dir, "widget.rs"),
+			[
+				"pub struct Widget {",
+				"    value: i32,",
+				"}",
+				"impl Widget {",
+				"    pub fn run(&self) -> i32 { self.value }",
+				"}",
+			].join("\n"),
+		);
+
+		const declaration = await executeRead(dir, {
+			path: "widget.rs",
+			action: "symbol",
+			symbol: "Widget",
+		});
+		expect(declaration.content[0].text).toContain("pub struct Widget");
+		expect(declaration.content[0].text).not.toContain("pub fn run");
+
+		const implementation = await executeRead(dir, {
+			path: "widget.rs",
+			action: "symbol",
+			symbol: "impl Widget",
+		});
+		expect(implementation.content[0].text).toContain("pub fn run");
+
+		const method = await executeRead(dir, {
+			path: "widget.rs",
+			action: "symbol",
+			symbol: "Widget::run",
+		});
+		expect(method.content[0].text).toContain("self.value");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
 test("oversized single-line symbol gives an exact continuation instead of silent loss", async () => {
 	const dir = tempDir();
 	try {
@@ -378,7 +453,7 @@ test("focus is bounded but exact fallback still returns omitted content", async 
 			path: "large.txt",
 			action: "focus",
 			pattern: "needle",
-			context: 45,
+			context: 100,
 			maxMatches: 30,
 			maxBytes: 2_000,
 		});
@@ -617,6 +692,23 @@ test("smart grep does not mistake context content containing path:line: for a fi
 	expect(indexed.text).toContain("other.ts (1)");
 	expect(indexed.text).not.toContain("fake.ts (1)");
 	expect(indexed.text).not.toContain("phantom.rs (1)");
+});
+
+test("smart grep indexes match paths containing hyphen-number segments", () => {
+	const exact = [
+		"BAC-6118-trace-summary.json-140- before",
+		"BAC-6118-trace-summary.json:141: Needle actual",
+		"BAC-6118-trace-summary.json-142- after",
+		"plain.ts:3: needle plain",
+	].join("\n");
+	const indexed = compactGrepOutput(exact, "/tmp/exact.txt", 8_000, 3, {
+		pattern: "needle",
+		ignoreCase: true,
+	});
+	expect(indexed.fileCount).toBe(2);
+	expect(indexed.matchCount).toBe(2);
+	expect(indexed.text).toContain("BAC-6118-trace-summary.json (1)");
+	expect(indexed.text).toContain("plain.ts (1)");
 });
 
 test("smart grep stays bounded and links exact output when every matched file cannot fit", async () => {

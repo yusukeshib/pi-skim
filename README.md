@@ -26,7 +26,7 @@ This is progressive disclosure, not lossy post-processing.
 | `read({ path })` | Exact pi built-in read |
 | `read({ path, offset, limit })` | Exact pi built-in line range |
 | `read({ path, action: "outline" })` | Symbol signatures and line ranges, without bodies |
-| `read({ path, action: "symbol", symbol })` | One named function/class/method/target |
+| `read({ path, action: "symbol", symbol })` | One named function/class/method/target; accepts qualified names or an exact candidate signature |
 | `read({ path, action: "focus", pattern })` | Bounded regex windows within one file |
 
 After removing the old `pi-ast-read` package, its two schemas are replaced by these `read` actions. `pi-skim` does not forcibly deactivate a co-loaded package because its old read hook could otherwise point at inactive tools during migration.
@@ -86,7 +86,11 @@ In the same-day replay, 180 broad grep calls produced 2.15MB. An 8KB smart-resul
 
 If detailed signatures exceed the outline budget, pi-skim saves both the full symbol index and detailed outline as artifacts. The bounded response includes every symbol name and range when they fit; otherwise it shows the largest fitting prefix and links both complete artifacts. Outline responses never exceed their explicit byte budget.
 
+When a name has multiple declarations, qualify a method as `Parent.child` or `Parent::child`, or pass an exact signature shown in the candidate list, such as `impl Widget`. For common Rust `struct Widget` plus `impl Widget` pairs, the plain name selects the type declaration.
+
 ### Focused windows
+
+Focus context accepts up to 500 surrounding lines; `maxBytes` still bounds the returned text.
 
 ```json
 {
