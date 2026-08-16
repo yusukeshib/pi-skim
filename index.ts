@@ -19,6 +19,33 @@ import {
 import { Type, type Static } from "typebox";
 
 const runFile = promisify(execFile);
+
+function runFileWithInput(
+	command: string,
+	args: string[],
+	input: string,
+	signal?: AbortSignal,
+): Promise<{ stdout: string; stderr: string }> {
+	return new Promise((resolve, reject) => {
+		const child = execFile(
+			command,
+			args,
+			{ encoding: "utf8", maxBuffer: 32 * 1024 * 1024, signal },
+			(error, stdout, stderr) => {
+				if (error) {
+					const failure = error as Error & { stderr?: string };
+					failure.stderr = stderr;
+					reject(failure);
+					return;
+				}
+				resolve({ stdout, stderr });
+			},
+		);
+		child.stdin?.on("error", () => {});
+		child.stdin?.end(input);
+	});
+}
+
 const DEFAULT_OPTIMIZED_BYTES = 8_000;
 const MAX_OPTIMIZED_BYTES = 32_000;
 const MAX_SOURCE_BYTES = 64 * 1024 * 1024;
@@ -253,7 +280,9 @@ async function firstLine(filePath: string): Promise<string> {
 	}
 }
 
-type DetectedSource = { type: "ast-grep"; config: LanguageConfig } | { type: "makefile" };
+type DetectedSource =
+	| { type: "ast-grep"; config: LanguageConfig; scanFromStdin?: boolean }
+	| { type: "makefile" };
 
 export async function detectSource(filePath: string): Promise<DetectedSource | undefined> {
 	if (isMakefile(filePath)) return { type: "makefile" };
@@ -262,7 +291,9 @@ export async function detectSource(filePath: string): Promise<DetectedSource | u
 	if (!extensionName(filePath)) {
 		try {
 			if (/^#!.*\b(bash|sh|zsh|ksh|dash)\b/.test(await firstLine(filePath))) {
-				return { type: "ast-grep", config: SHELL };
+				// ast-grep filters filesystem scan targets by extension even when a
+				// language is explicit. Stdin mode bypasses filename inference.
+				return { type: "ast-grep", config: SHELL, scanFromStdin: true };
 			}
 		} catch {
 			return undefined;
@@ -275,17 +306,25 @@ async function astGrepSymbols(
 	filePath: string,
 	config: LanguageConfig,
 	signal?: AbortSignal,
+	scanFromStdin = false,
 ): Promise<SymbolInfo[]> {
 	const rule =
 		`id: pi-skim-outline\nlanguage: ${config.language}\nrule:\n  any:\n` +
 		config.kinds.map((kind) => `    - kind: ${kind}`).join("\n");
 	let stdout: string;
 	try {
-		const result = await runFile(
-			"ast-grep",
-			["scan", "--inline-rules", rule, "--json=compact", filePath],
-			{ maxBuffer: 32 * 1024 * 1024, signal },
-		);
+		const result = scanFromStdin
+			? await runFileWithInput(
+				"ast-grep",
+				["run", "--stdin", "--lang", config.language, "--kind", config.kinds[0]!, "--json=compact"],
+				await readFile(filePath, "utf8"),
+				signal,
+			)
+			: await runFile(
+				"ast-grep",
+				["scan", "--inline-rules", rule, "--json=compact", filePath],
+				{ maxBuffer: 32 * 1024 * 1024, signal },
+			);
 		stdout = result.stdout;
 	} catch (error) {
 		const failure = error as { code?: string; stderr?: string; message?: string };
@@ -371,7 +410,7 @@ export async function symbolsFor(filePath: string, signal?: AbortSignal): Promis
 	}
 	return detected.type === "makefile"
 		? makefileSymbols(filePath)
-		: astGrepSymbols(filePath, detected.config, signal);
+		: astGrepSymbols(filePath, detected.config, signal, detected.scanFromStdin);
 }
 
 export async function cleanupStaleArtifacts(

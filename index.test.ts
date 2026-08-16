@@ -173,6 +173,36 @@ test("outline and qualified symbol preserve structural navigation", async () => 
 	}
 });
 
+test("extensionless shell scripts use their shebang for outline and symbol reads", async () => {
+	const dir = tempDir();
+	try {
+		writeFileSync(
+			path.join(dir, "script"),
+			[
+				"#!/usr/bin/env bash",
+				"alpha() {",
+				"  echo alpha",
+				"}",
+				"beta() { echo beta; }",
+			].join("\n"),
+		);
+
+		const outline = await executeRead(dir, { path: "script", action: "outline" });
+		expect(outline.content[0].text).toContain("alpha()");
+		expect(outline.content[0].text).toContain("beta()");
+
+		const symbol = await executeRead(dir, {
+			path: "script",
+			action: "symbol",
+			symbol: "alpha",
+		});
+		expect(symbol.content[0].text).toContain("echo alpha");
+		expect(symbol.content[0].text).not.toContain("echo beta");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
 test("JavaScript and JSX outlines use grammar-valid symbol kinds", async () => {
 	const dir = tempDir();
 	try {
