@@ -1,9 +1,10 @@
 import { expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { createGrepToolDefinition, createReadToolDefinition } from "@earendil-works/pi-coding-agent";
-import extension, { cleanupStaleArtifacts, compactGrepOutput } from "./index.ts";
+import extension, { cleanupStaleArtifacts, compactGrepOutput, resolveOptimizedPath } from "./index.ts";
 
 const tools = new Map<string, any>();
 const hooks = new Map<string, any>();
@@ -68,6 +69,15 @@ test("takes over read and grep without touching babysit or old AST tools", () =>
 	expect(tools.get("read").promptGuidelines.join(" ")).toContain("action=outline");
 	expect(tools.get("grep").promptGuidelines.join(" ")).not.toContain("babysit");
 	expect(tools.get("grep").promptGuidelines.join(" ")).toContain("never select it preemptively");
+});
+
+test("optimized paths match built-in local path forms", () => {
+	const cwd = "/tmp/pi-skim-cwd";
+	expect(resolveOptimizedPath(cwd, "@src/main.ts")).toBe(path.resolve(cwd, "src/main.ts"));
+	expect(resolveOptimizedPath(cwd, "src\u00a0main.ts")).toBe(path.resolve(cwd, "src main.ts"));
+	expect(resolveOptimizedPath(cwd, "~/sample.ts")).toBe(path.join(homedir(), "sample.ts"));
+	const absolute = path.resolve(cwd, "source with spaces.ts");
+	expect(resolveOptimizedPath(cwd, pathToFileURL(absolute).href)).toBe(absolute);
 });
 
 test("default and action=exact output are byte-for-byte built-in read behavior", async () => {
@@ -363,6 +373,44 @@ test("outline stays bounded when even the complete symbol index exceeds the budg
 	} finally {
 		const artifactPath = symbolIndexPath ?? detailedPath;
 		if (artifactPath) rmSync(path.dirname(artifactPath), { recursive: true, force: true });
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("Makefile multi-target rules expose every target and round-trip candidate signatures", async () => {
+	const dir = tempDir();
+	try {
+		writeFileSync(
+			path.join(dir, "Makefile"),
+			"alpha beta: dependency\n\t@echo built\n\ndependency:\n\t@echo dependency\n",
+		);
+		for (const symbol of ["alpha", "beta", "alpha: alpha beta: dependency"]) {
+			const result = await executeRead(dir, { path: "Makefile", action: "symbol", symbol });
+			expect(result.content[0].text).toContain("@echo built");
+			expect(result.content[0].text).not.toContain("@echo dependency");
+		}
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("multibyte optimized-read headers stay within the byte cap", async () => {
+	const dir = tempDir();
+	try {
+		const nested = Array.from({ length: 18 }, () => "巨大な場所".repeat(3)).join(path.sep);
+		const relative = path.join(nested, "source.ts");
+		mkdirSync(path.dirname(path.join(dir, relative)), { recursive: true });
+		writeFileSync(path.join(dir, relative), `function huge() { return "${"値".repeat(4_000)}"; }\n`);
+		for (const input of [
+			{ path: relative, action: "symbol", symbol: "huge", maxBytes: 1_000 },
+			{ path: relative, action: "focus", pattern: "値", maxBytes: 1_000 },
+		]) {
+			const result = await executeRead(dir, input);
+			expect(Buffer.byteLength(result.content[0].text, "utf8")).toBeLessThanOrEqual(1_000);
+			expect(result.content[0].text).not.toContain("�");
+			expect(result.content[0].text).toContain("exact read");
+		}
+	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
 });

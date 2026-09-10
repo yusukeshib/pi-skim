@@ -1,7 +1,9 @@
 import { execFile } from "node:child_process";
+import { accessSync, constants } from "node:fs";
 import { mkdtemp, open, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
@@ -53,6 +55,50 @@ const READ_NUDGE_BYTES = Number(process.env.PI_SKIM_NUDGE_BYTES) || 20_000;
 const DEFAULT_GREP_MAX_PER_FILE = 3;
 const ARTIFACT_TTL_MS = Number(process.env.PI_SKIM_ARTIFACT_TTL_MS) || 7 * 24 * 60 * 60 * 1_000;
 const ARTIFACT_PREFIXES = ["pi-skim-grep-", "pi-skim-outline-"];
+
+export function resolveOptimizedPath(cwd: string, input: string): string {
+	let normalized = input.replace(/[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g, " ");
+	if (normalized.startsWith("@")) normalized = normalized.slice(1);
+	if (normalized === "~") normalized = homedir();
+	else if (
+		normalized.startsWith("~/") ||
+		(process.platform === "win32" && normalized.startsWith("~\\"))
+	) {
+		normalized = path.join(homedir(), normalized.slice(2));
+	}
+	if (/^file:\/\//.test(normalized)) normalized = fileURLToPath(normalized);
+	const resolved = path.resolve(cwd, normalized);
+	const exists = (candidate: string) => {
+		try {
+			accessSync(candidate, constants.F_OK);
+			return true;
+		} catch {
+			return false;
+		}
+	};
+	if (exists(resolved)) return resolved;
+	const variants = [
+		resolved.replace(/ (AM|PM)\./gi, "\u202f$1."),
+		resolved.normalize("NFD"),
+		resolved.replace(/'/g, "’"),
+		resolved.normalize("NFD").replace(/'/g, "’"),
+	];
+	return variants.find((candidate) => candidate !== resolved && exists(candidate)) ?? resolved;
+}
+
+function truncateUtf8(text: string, maxBytes: number): string {
+	if (maxBytes <= 0) return "";
+	let result = "";
+	let bytes = 0;
+	for (const character of text) {
+		const size = byteLength(character);
+		if (bytes + size > maxBytes) break;
+		result += character;
+		bytes += size;
+	}
+	return result;
+}
+
 const readSchema = Type.Object({
 	path: Type.String({ description: "Path to the file to read (relative or absolute)" }),
 	offset: Type.Optional(Type.Number({ description: "Line number to start reading from (1-indexed)" })),
@@ -380,8 +426,8 @@ async function makefileSymbols(filePath: string): Promise<SymbolInfo[]> {
 			});
 			continue;
 		}
-		const target = line.match(/^([^\t=:#][^:=]*):(?!=)/)?.[1]?.trim().split(/\s+/)[0];
-		if (target) {
+		const targets = line.match(/^([^\t=:#][^:=]*):(?!=)/)?.[1]?.trim().split(/\s+/).filter(Boolean) ?? [];
+		for (const target of targets) {
 			definitions.push({
 				name: target,
 				signature: line.trim().slice(0, 140),
@@ -392,11 +438,10 @@ async function makefileSymbols(filePath: string): Promise<SymbolInfo[]> {
 			});
 		}
 	}
-	for (const [index, definition] of definitions.entries()) {
+	for (const definition of definitions) {
 		if (definition.singleLine) continue;
-		definition.end = definitions[index + 1]?.start
-			? definitions[index + 1]!.start - 1
-			: lines.length;
+		const next = definitions.find((candidate) => candidate.start > definition.start);
+		definition.end = next ? next.start - 1 : lines.length;
 	}
 	return definitions.map(({ singleLine: _singleLine, ...symbol }) => symbol);
 }
@@ -623,11 +668,24 @@ async function optimizedRead(
 	if (action === "symbol") {
 		if (!params.symbol) throw new Error("`symbol` is required for read action=symbol");
 		const symbols = await symbolsFor(absolutePath, signal);
-		const signature = explicitSignature(params.symbol);
+		const candidateSignature = params.symbol.includes(": ")
+			? params.symbol.slice(params.symbol.indexOf(": ") + 2)
+			: params.symbol;
+		const signature = symbols.some((symbol) => symbol.signature === candidateSignature)
+			? candidateSignature
+			: explicitSignature(params.symbol);
 		const selector = splitSymbolSelector(params.symbol);
 		let hits = signature
 			? symbols.filter((symbol) => symbol.signature === signature)
 			: symbols.filter((symbol) => symbol.name === selector.target);
+		if (
+			hits.length > 1 &&
+			hits.every(
+				(hit) => hit.start === hits[0]!.start && hit.end === hits[0]!.end && hit.signature === hits[0]!.signature,
+			)
+		) {
+			hits = [hits[0]!];
+		}
 		if (!signature && selector.parent) {
 			const parents = symbols.filter(
 				(symbol) => symbol.name === selector.parent || symbol.signature === selector.parent,
@@ -666,26 +724,36 @@ async function optimizedRead(
 		const allLines = normalizeLines(await readFile(absolutePath, "utf8"));
 		const source = numberedLines(allLines.slice(hit.start - 1, hit.end), hit.start);
 		const header = `${params.path}:${hit.start}-${hit.end} ${hit.signature}`;
-		const bodyBudget = Math.max(1, maxBytes - byteLength(header) - 300);
+		const fullBody = source.map((line) => line.text).join("\n");
+		const fullText = `${header}\n${fullBody}`;
+		if (byteLength(fullText) <= maxBytes) {
+			return { content: [{ type: "text", text: fullText }], details: undefined };
+		}
+
+		const reservedContinuation =
+			`\n\n[Symbol continues to line ${hit.end}. Use exact read with offset=${hit.end}, ` +
+			`limit=${hit.end - hit.start + 1}.]`;
+		const safeHeader = truncateUtf8(
+			header,
+			Math.max(0, maxBytes - byteLength("\n") - byteLength(reservedContinuation)),
+		);
+		const bodyBudget = Math.max(
+			0,
+			maxBytes - byteLength(`${safeHeader}\n`) - byteLength(reservedContinuation),
+		);
 		const fitted = fitNumberedLines(source, bodyBudget);
-		const nextOffset = fitted.lastLine === undefined
-			? hit.start
-			: fitted.lastLine < hit.end
-				? fitted.lastLine + 1
-				: undefined;
-		const continuation = nextOffset
-			? `\n\n[Symbol continues to line ${hit.end}. Use exact read with offset=${nextOffset}, limit=${hit.end - nextOffset + 1}.]`
-			: "";
+		const nextOffset = fitted.lastLine === undefined ? hit.start : fitted.lastLine + 1;
+		const continuation =
+			`\n\n[Symbol continues to line ${hit.end}. Use exact read with offset=${nextOffset}, ` +
+			`limit=${hit.end - nextOffset + 1}.]`;
 		return {
-			content: [{ type: "text", text: `${header}\n${fitted.text}${continuation}` }],
-			details: fitted.truncated
-				? {
-					truncation: truncateHead(source.map((line) => line.text).join("\n"), {
-						maxBytes: bodyBudget,
-						maxLines: DEFAULT_MAX_LINES,
-					}),
-				}
-				: undefined,
+			content: [{ type: "text", text: `${safeHeader}\n${fitted.text}${continuation}` }],
+			details: {
+				truncation: truncateHead(fullBody, {
+					maxBytes: Math.max(1, bodyBudget),
+					maxLines: DEFAULT_MAX_LINES,
+				}),
+			},
 		};
 	}
 
@@ -733,18 +801,26 @@ async function optimizedRead(
 			previous = line;
 		}
 		const header = `${params.path}: ${matches.length} matches, showing up to ${selectedMatches.length}`;
-		const bodyBudget = Math.max(1, maxBytes - byteLength(header) - 250);
+		const fullBody = rendered.map((line) => line.text).join("\n") || "No matches found";
+		const fullText = `${header}\n${fullBody}`;
+		if (selectedMatches.length === matches.length && byteLength(fullText) <= maxBytes) {
+			return { content: [{ type: "text", text: fullText }], details: undefined };
+		}
+
+		const notice =
+			"\n\n[Focused output bounded. Refine pattern/offset/limit, or use exact read for complete content.]";
+		const safeHeader = truncateUtf8(
+			header,
+			Math.max(0, maxBytes - byteLength("\n") - byteLength(notice)),
+		);
+		const bodyBudget = Math.max(0, maxBytes - byteLength(`${safeHeader}\n`) - byteLength(notice));
 		const fitted = fitNumberedLines(rendered, bodyBudget);
-		const omitted = fitted.truncated || selectedMatches.length < matches.length;
-		const notice = omitted
-			? `\n\n[Focused output bounded. Refine pattern/offset/limit, or use exact read for complete content.]`
-			: "";
 		return {
-			content: [{ type: "text", text: `${header}\n${fitted.text || "No matches found"}${notice}` }],
+			content: [{ type: "text", text: `${safeHeader}\n${fitted.text}${notice}` }],
 			details: fitted.truncated
 				? {
 					truncation: truncateHead(rendered.map((line) => line.text).join("\n"), {
-						maxBytes: bodyBudget,
+						maxBytes: Math.max(1, bodyBudget),
 						maxLines: DEFAULT_MAX_LINES,
 					}),
 				}
@@ -926,7 +1002,7 @@ export default function extension(pi: ExtensionAPI): void {
 					ctx,
 				);
 			}
-			const absolutePath = path.resolve(ctx.cwd, params.path.replace(/^@/, ""));
+			const absolutePath = resolveOptimizedPath(ctx.cwd, params.path);
 			return optimizedRead(params, absolutePath, signal);
 		},
 	});
@@ -1009,7 +1085,12 @@ export default function extension(pi: ExtensionAPI): void {
 		) {
 			return;
 		}
-		const absolutePath = path.resolve(ctx.cwd, input.path.replace(/^@/, ""));
+		let absolutePath: string;
+		try {
+			absolutePath = resolveOptimizedPath(ctx.cwd, input.path);
+		} catch {
+			return;
+		}
 		const key = stableKey("read", { path: absolutePath });
 		if (readNudges.has(key)) return;
 		// Reserve before async detection/stat so parallel identical reads cannot both be blocked.
