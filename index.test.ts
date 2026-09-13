@@ -1,10 +1,10 @@
 import { expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { createGrepToolDefinition, createReadToolDefinition } from "@earendil-works/pi-coding-agent";
-import extension, { cleanupStaleArtifacts, compactGrepOutput, resolveOptimizedPath } from "./index.ts";
+import extension, { cleanupStaleArtifacts, compactGrepRecords, resolveOptimizedPath } from "./index.ts";
 
 const tools = new Map<string, any>();
 const hooks = new Map<string, any>();
@@ -655,6 +655,49 @@ test("small grep and mode=exact preserve built-in output", async () => {
 	}
 });
 
+test("small smart grep differentially matches built-in search semantics", async () => {
+	const dir = tempDir();
+	try {
+		mkdirSync(path.join(dir, ".git"));
+		mkdirSync(path.join(dir, "src"));
+		writeFileSync(path.join(dir, ".gitignore"), "ignored.txt\n");
+		writeFileSync(path.join(dir, "ignored.txt"), "Needle ignored\n");
+		writeFileSync(path.join(dir, ".hidden.ts"), "Needle hidden\n");
+		writeFileSync(path.join(dir, "src", "one.ts"), "before\nNeedle.* literal\nafter\n");
+		writeFileSync(path.join(dir, "src", "two.txt"), "needle.* lower\n");
+		const cases = [
+			{ pattern: "Needle", path: "." },
+			{ pattern: "needle", path: ".", ignoreCase: true },
+			{ pattern: "Needle.*", path: ".", literal: true },
+			{ pattern: "Needle", path: ".", glob: "*.ts" },
+			{ pattern: "Needle", path: "src/one.ts", context: 1 },
+			{ pattern: "Needle", path: ".", limit: 1 },
+		];
+		for (const input of cases) {
+			expect(await executeGrep(dir, input)).toEqual(await executeBuiltInGrep(dir, input));
+		}
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("small smart grep differentially preserves long-line notices", async () => {
+	const dir = tempDir();
+	try {
+		writeFileSync(path.join(dir, "long.txt"), `needle ${"x".repeat(700)}\n`);
+		const input = { pattern: "needle", path: "long.txt" };
+		expect(await executeGrep(dir, input)).toEqual(await executeBuiltInGrep(dir, input));
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("an already-cancelled smart grep fails consistently", async () => {
+	const controller = new AbortController();
+	controller.abort();
+	await expect(tools.get("grep").execute("grep-call", { pattern: "x" }, controller.signal, undefined, ctx(process.cwd()))).rejects.toThrow("Operation aborted");
+});
+
 test("exact grep preserves built-in errors", async () => {
 	const dir = tempDir();
 	try {
@@ -756,14 +799,48 @@ test("oversized grep becomes a bounded cross-file index with exact output preser
 	}
 });
 
-test("smart grep does not mistake context content containing path:line: for a file", () => {
-	const exact = [
-		'actual.ts-8- expect(saved).toContain("fake.ts:1: needle")',
-		"actual.ts:9: needle actual",
-		'other.ts-2- const sample = "phantom.rs:44: hit"',
-		"other.ts:3: needle other",
-	].join("\n");
-	const indexed = compactGrepOutput(exact, "/tmp/exact.txt");
+test("oversized smart grep uses one rg process and safely indexes adversarial paths and content", async () => {
+	const dir = tempDir();
+	const bin = tempDir();
+	let exactPath: string | undefined;
+	const oldPath = process.env.PATH;
+	try {
+		const realRg = Bun.which("rg");
+		if (!realRg) throw new Error("rg is required for this test");
+		const calls = path.join(bin, "calls");
+		writeFileSync(path.join(bin, "rg"), `#!/bin/sh\nprintf 'call\\n' >> ${JSON.stringify(calls)}\nexec ${JSON.stringify(realRg)} "$@"\n`);
+		chmodSync(path.join(bin, "rg"), 0o755);
+		process.env.PATH = `${bin}${path.delimiter}${oldPath ?? ""}`;
+		const oddName = "colon:7-hyphen\nname.ts";
+		for (const name of [oddName, "plain.ts"]) {
+			writeFileSync(path.join(dir, name), Array.from({ length: 45 }, (_, index) => `needle ${index} fake.ts:1: needle ${"x".repeat(80)}`).join("\n"));
+		}
+		const input = { pattern: "needle", path: ".", limit: 100 };
+		const result = await executeGrep(dir, input);
+		expect(readFileSync(calls, "utf8").trim().split("\n")).toHaveLength(1);
+		expect(result.content[0].text).toContain("colon:7-hyphen\\nname.ts (45)");
+		expect(result.content[0].text).not.toContain("fake.ts (90)");
+		exactPath = result.content[0].text.match(/\[Full exact grep result: (.+)\]/)?.[1];
+		expect(exactPath).toBeTruthy();
+		const saved = await Bun.file(exactPath!).text();
+		expect(saved).toContain("plain.ts:45: needle 44");
+		expect(saved).toContain("colon:7-hyphen\nname.ts:45: needle 44");
+	} finally {
+		process.env.PATH = oldPath;
+		if (exactPath) rmSync(path.dirname(exactPath), { recursive: true, force: true });
+		rmSync(bin, { recursive: true, force: true });
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("smart grep indexes structured records without interpreting adversarial content", () => {
+	const indexed = compactGrepRecords(
+		[
+			{ path: "actual.ts", line: 9, text: 'needle fake.ts:1: needle and phantom.rs:44: hit' },
+			{ path: "other.ts", line: 3, text: "needle other" },
+		],
+		"/tmp/exact.txt",
+	);
 	expect(indexed.fileCount).toBe(2);
 	expect(indexed.matchCount).toBe(2);
 	expect(indexed.text).toContain("actual.ts (1)");
@@ -772,20 +849,17 @@ test("smart grep does not mistake context content containing path:line: for a fi
 	expect(indexed.text).not.toContain("phantom.rs (1)");
 });
 
-test("smart grep indexes match paths containing hyphen-number segments", () => {
-	const exact = [
-		"BAC-6118-trace-summary.json-140- before",
-		"BAC-6118-trace-summary.json:141: Needle actual",
-		"BAC-6118-trace-summary.json-142- after",
-		"plain.ts:3: needle plain",
-	].join("\n");
-	const indexed = compactGrepOutput(exact, "/tmp/exact.txt", 8_000, 3, {
-		pattern: "needle",
-		ignoreCase: true,
-	});
+test("smart grep indexes structured paths containing delimiter-like segments", () => {
+	const indexed = compactGrepRecords(
+		[
+			{ path: "BAC-6118-trace:summary.json", line: 141, text: "Needle actual" },
+			{ path: "plain.ts", line: 3, text: "needle plain" },
+		],
+		"/tmp/exact.txt",
+	);
 	expect(indexed.fileCount).toBe(2);
 	expect(indexed.matchCount).toBe(2);
-	expect(indexed.text).toContain("BAC-6118-trace-summary.json (1)");
+	expect(indexed.text).toContain("BAC-6118-trace:summary.json (1)");
 	expect(indexed.text).toContain("plain.ts (1)");
 });
 
@@ -822,7 +896,8 @@ test("manifest overflow remains bounded when the exact-result path is too long",
 		{ length: 30 },
 		(_, index) => `very-long-${index}.ts:${index + 1}: needle ${"x".repeat(300)}`,
 	).join("\n");
-	const result = compactGrepOutput(exact, `/tmp/${"nested/".repeat(200)}exact-output.txt`, 1_000);
+	const records = exact.split("\n").map((text, index) => ({ path: `very-long-${index}.ts`, line: index + 1, text }));
+	const result = compactGrepRecords(records, `/tmp/${"nested/".repeat(200)}exact-output.txt`, 1_000);
 	expect(result.allFilesIndexed).toBe(false);
 	expect(Buffer.byteLength(result.text)).toBeLessThanOrEqual(1_000);
 	expect(result.text).toContain("exact-result path exceeds");

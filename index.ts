@@ -1,6 +1,7 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { accessSync, constants } from "node:fs";
 import { mkdtemp, open, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { createInterface } from "node:readline";
 import { homedir, tmpdir } from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -831,6 +832,12 @@ async function optimizedRead(
 	throw new Error(`Unsupported optimized read action: ${String(action)}`);
 }
 
+export interface GrepMatchRecord {
+	path: string;
+	line: number;
+	text: string;
+}
+
 interface GrepGroup {
 	path: string;
 	matchCount: number;
@@ -845,26 +852,19 @@ export interface SmartGrepIndex {
 	indexTruncated: boolean;
 }
 
-interface GrepParseOptions {
-	pattern: string;
-	literal?: boolean;
-	ignoreCase?: boolean;
+interface SmartGrepRun {
+	exact: { content: Array<{ type: "text"; text: string }>; details: GrepToolDetails | undefined };
+	records: GrepMatchRecord[];
 }
 
-function grepContentMatcher(options?: GrepParseOptions): ((text: string) => boolean) | undefined {
-	if (!options) return undefined;
-	try {
-		const pattern = options.literal
-			? options.pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-			: options.pattern;
-		const regex = new RegExp(pattern, options.ignoreCase ? "i" : "");
-		return (text) => {
-			regex.lastIndex = 0;
-			return regex.test(text);
-		};
-	} catch {
-		return undefined;
-	}
+function truncateGrepLine(line: string): { text: string; truncated: boolean } {
+	return line.length <= 500
+		? { text: line, truncated: false }
+		: { text: `${line.slice(0, 500)}... [truncated]`, truncated: true };
+}
+
+function renderIndexPath(filePath: string): string {
+	return filePath.replace(/\\/g, "\\\\").replace(/\r/g, "\\r").replace(/\n/g, "\\n").replace(/\t/g, "\\t");
 }
 
 function fitPlainLines(lines: string[], maxBytes: number): { text: string; shown: number } {
@@ -879,46 +879,26 @@ function fitPlainLines(lines: string[], maxBytes: number): { text: string; shown
 	return { text: selected.join("\n"), shown: selected.length };
 }
 
-export function compactGrepOutput(
-	exactOutput: string,
+export function compactGrepRecords(
+	records: GrepMatchRecord[],
 	fullOutputPath: string,
 	maxBytes = DEFAULT_OPTIMIZED_BYTES,
 	maxPerFile = DEFAULT_GREP_MAX_PER_FILE,
-	parseOptions?: GrepParseOptions,
+	notices: string[] = [],
 ): SmartGrepIndex {
 	const groups = new Map<string, GrepGroup>();
-	const notices: string[] = [];
-	const matchesPattern = grepContentMatcher(parseOptions);
-	for (const line of exactOutput.split("\n")) {
-		const match = line.match(/^(.+?):(\d+):\s?(.*)$/);
-		const context = line.match(/^(.+?)-(\d+)-\s?(.*)$/);
-		// With grep context, a context line may itself contain `path:line:` text, while a real
-		// match path may contain `-number-`. Query matching disambiguates those two shapes.
-		const contextDelimiterPrecedesMatch =
-			match?.[2] !== undefined &&
-			context?.[2] !== undefined &&
-			line.indexOf(`-${context[2]}-`) < line.indexOf(`:${match[2]}:`);
-		const isMatch =
-			match?.index !== undefined &&
-			(!contextDelimiterPrecedesMatch || matchesPattern?.(match[3] ?? "") === true);
-		if (isMatch && match?.[1] && match[2] && match[3] !== undefined) {
-			let group = groups.get(match[1]);
-			if (!group) {
-				group = { path: match[1], matchCount: 0, samples: [] };
-				groups.set(match[1], group);
-			}
-			group.matchCount++;
-			if (group.samples.length < maxPerFile) {
-				group.samples.push({
-					line: Number.parseInt(match[2], 10),
-					text: match[3].slice(0, 320),
-				});
-			}
-		} else if (line.startsWith("[") && line.endsWith("]")) {
-			notices.push(line);
+	for (const record of records) {
+		let group = groups.get(record.path);
+		if (!group) {
+			group = { path: record.path, matchCount: 0, samples: [] };
+			groups.set(record.path, group);
+		}
+		group.matchCount++;
+		if (group.samples.length < maxPerFile) {
+			group.samples.push({ line: record.line, text: record.text.slice(0, 320) });
 		}
 	}
-	const matchCount = [...groups.values()].reduce((sum, group) => sum + group.matchCount, 0);
+	const matchCount = records.length;
 	const requiredFooterLines = [
 		`[Smart grep index: ${matchCount} returned matches across ${groups.size} files. Match context and additional lines are preserved in the exact result.]`,
 		`[Full exact grep result: ${fullOutputPath}]`,
@@ -934,13 +914,12 @@ export function compactGrepOutput(
 	const footerFits = byteLength(footer) + 2 < maxBytes;
 	const bodyBudget = Math.max(1, maxBytes - byteLength(footer) - 2);
 	const bodyLines: string[] = ["Matches by file:"];
-	for (const group of groups.values()) bodyLines.push(`${group.path} (${group.matchCount})`);
+	for (const group of groups.values()) bodyLines.push(`${renderIndexPath(group.path)} (${group.matchCount})`);
 	bodyLines.push("", "Representative matches:");
 	for (const group of groups.values()) {
-		bodyLines.push(`${group.path}:`);
+		bodyLines.push(`${renderIndexPath(group.path)}:`);
 		for (const sample of group.samples) bodyLines.push(`  ${sample.line}: ${sample.text}`);
 	}
-	if (groups.size === 0) bodyLines.push(exactOutput.slice(0, 1_000));
 	const fitted = fitPlainLines(bodyLines, bodyBudget);
 	const allFilesIndexed = footerFits && groups.size > 0 && fitted.shown >= 1 + groups.size;
 	if (!allFilesIndexed) {
@@ -971,6 +950,141 @@ export function compactGrepOutput(
 		allFilesIndexed,
 		indexTruncated: fitted.shown < bodyLines.length,
 	};
+}
+
+async function runSmartGrep(
+	params: SmartGrepInput,
+	cwd: string,
+	signal?: AbortSignal,
+): Promise<SmartGrepRun> {
+	if (signal?.aborted) throw new Error("Operation aborted");
+	const searchPath = resolveOptimizedPath(cwd, params.path || ".");
+	let isDirectory: boolean;
+	try {
+		isDirectory = (await stat(searchPath)).isDirectory();
+	} catch {
+		throw new Error(`Path not found: ${searchPath}`);
+	}
+	const context = params.context && params.context > 0 ? params.context : 0;
+	const limit = Math.max(1, params.limit ?? 100);
+	const args = ["--json", "--line-number", "--color=never", "--hidden"];
+	if (params.ignoreCase) args.push("--ignore-case");
+	if (params.literal) args.push("--fixed-strings");
+	if (params.glob) args.push("--glob", params.glob);
+	args.push("--", params.pattern, searchPath);
+
+	return new Promise((resolve, reject) => {
+		const child = spawn("rg", args, { stdio: ["ignore", "pipe", "pipe"] });
+		const reader = createInterface({ input: child.stdout });
+		const matches: Array<{ filePath: string; line: number; text?: string }> = [];
+		let stderr = "";
+		let count = 0;
+		let limitReached = false;
+		let killedForLimit = false;
+		let aborted = false;
+		let settled = false;
+		let malformed: Error | undefined;
+		const settle = (fn: () => void) => { if (!settled) { settled = true; fn(); } };
+		const cleanup = () => { reader.close(); signal?.removeEventListener("abort", onAbort); };
+		const stop = (forLimit = false) => {
+			if (!child.killed) { killedForLimit = forLimit; child.kill(); }
+		};
+		const onAbort = () => { aborted = true; stop(); };
+		signal?.addEventListener("abort", onAbort, { once: true });
+		child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+		reader.on("line", (line) => {
+			if (!line.trim() || count >= limit || malformed) return;
+			let event: any;
+			try { event = JSON.parse(line); }
+			catch { malformed = new Error("Failed to parse ripgrep JSON output"); stop(); return; }
+			if (event.type !== "match") return;
+			const filePath = event.data?.path?.text;
+			const lineNumber = event.data?.line_number;
+			if (typeof filePath !== "string" || typeof lineNumber !== "number") {
+				malformed = new Error("Unsupported ripgrep match record");
+				stop();
+				return;
+			}
+			count++;
+			matches.push({ filePath, line: lineNumber, text: event.data?.lines?.text });
+			if (count >= limit) { limitReached = true; stop(true); }
+		});
+		child.on("error", (error) => {
+			cleanup();
+			settle(() => reject(new Error(`Failed to run ripgrep: ${error.message}`)));
+		});
+		child.on("close", async (code) => {
+			cleanup();
+			if (aborted) return settle(() => reject(new Error("Operation aborted")));
+			if (malformed) return settle(() => reject(malformed));
+			if (!killedForLimit && code !== 0 && code !== 1) {
+				return settle(() => reject(new Error(stderr.trim() || `ripgrep exited with code ${code}`)));
+			}
+			if (matches.length === 0) {
+				return settle(() => resolve({ exact: { content: [{ type: "text", text: "No matches found" }], details: undefined }, records: [] }));
+			}
+			try {
+				const formatPath = (filePath: string) => {
+					if (isDirectory) {
+						const relative = path.relative(searchPath, filePath);
+						if (relative && !relative.startsWith("..")) return relative.replace(/\\/g, "/");
+					}
+					return path.basename(filePath);
+				};
+				const cache = new Map<string, string[]>();
+				const getLines = async (filePath: string) => {
+					let lines = cache.get(filePath);
+					if (!lines) {
+						try { lines = (await readFile(filePath, "utf8")).replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n"); }
+						catch { lines = []; }
+						cache.set(filePath, lines);
+					}
+					return lines;
+				};
+				const output: string[] = [];
+				const records: GrepMatchRecord[] = [];
+				let linesTruncated = false;
+				for (const match of matches) {
+					const displayPath = formatPath(match.filePath);
+					let sample = "";
+					if (context === 0 && match.text !== undefined) {
+						const sanitized = match.text.replace(/\r\n/g, "\n").replace(/\r/g, "").replace(/\n$/, "");
+						const truncated = truncateGrepLine(sanitized);
+						linesTruncated ||= truncated.truncated;
+						sample = truncated.text;
+						output.push(`${displayPath}:${match.line}: ${sample}`);
+					} else {
+						const lines = await getLines(match.filePath);
+						if (!lines.length) {
+							sample = "(unable to read file)";
+							output.push(`${displayPath}:${match.line}: ${sample}`);
+						} else {
+							const start = context > 0 ? Math.max(1, match.line - context) : match.line;
+							const end = context > 0 ? Math.min(lines.length, match.line + context) : match.line;
+							for (let current = start; current <= end; current++) {
+								const truncated = truncateGrepLine((lines[current - 1] ?? "").replace(/\r/g, ""));
+								linesTruncated ||= truncated.truncated;
+								if (current === match.line) sample = truncated.text;
+								output.push(`${displayPath}${current === match.line ? ":" : "-"}${current}${current === match.line ? ":" : "-"} ${truncated.text}`);
+							}
+						}
+					}
+					records.push({ path: displayPath, line: match.line, text: sample });
+				}
+				const truncation = truncateHead(output.join("\n"), { maxLines: Number.MAX_SAFE_INTEGER });
+				let text = truncation.content;
+				const notices: string[] = [];
+				const details: GrepToolDetails = {};
+				if (limitReached) { notices.push(`${limit} matches limit reached. Use limit=${limit * 2} for more, or refine pattern`); details.matchLimitReached = limit; }
+				if (truncation.truncated) { notices.push(`${formatSize(DEFAULT_MAX_BYTES)} limit reached`); details.truncation = truncation; }
+				if (linesTruncated) { notices.push("Some lines truncated to 500 chars. Use read tool to see full lines"); details.linesTruncated = true; }
+				if (notices.length) text += `\n\n[${notices.join(". ")}]`;
+				settle(() => resolve({ exact: { content: [{ type: "text", text }], details: Object.keys(details).length ? details : undefined }, records }));
+			} catch (error) {
+				settle(() => reject(error));
+			}
+		});
+	});
 }
 
 function stableKey(toolName: string, input: unknown): string {
@@ -1019,51 +1133,48 @@ export default function extension(pi: ExtensionAPI): void {
 		],
 		parameters: grepSchema,
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			const builtIn = createGrepToolDefinition(ctx.cwd);
-			const exact = await builtIn.execute(
-				toolCallId,
-				{
-					pattern: params.pattern,
-					path: params.path,
-					glob: params.glob,
-					ignoreCase: params.ignoreCase,
-					literal: params.literal,
-					context: params.context,
-					limit: params.limit,
-				},
-				signal,
-				onUpdate,
-				ctx,
-			);
-			if (params.mode === "exact") return exact;
-			const content = exact.content[0];
-			if (content?.type !== "text") return exact;
-			const maxBytes = params.maxBytes ?? DEFAULT_OPTIMIZED_BYTES;
-			if (byteLength(content.text) <= DEFAULT_OPTIMIZED_BYTES) return exact;
+			if (params.mode === "exact") {
+				const builtIn = createGrepToolDefinition(ctx.cwd);
+				return builtIn.execute(
+					toolCallId,
+					{
+						pattern: params.pattern,
+						path: params.path,
+						glob: params.glob,
+						ignoreCase: params.ignoreCase,
+						literal: params.literal,
+						context: params.context,
+						limit: params.limit,
+					},
+					signal,
+					onUpdate,
+					ctx,
+				);
+			}
+			const run = await runSmartGrep(params, ctx.cwd, signal);
+			const content = run.exact.content[0];
+			if (byteLength(content.text) <= DEFAULT_OPTIMIZED_BYTES) return run.exact;
 			let outputDir: string | undefined;
 			try {
 				outputDir = await mkdtemp(path.join(tmpdir(), "pi-skim-grep-"));
 				const fullOutputPath = path.join(outputDir, "exact-output.txt");
-				const indexed = compactGrepOutput(
-					content.text,
+				const notice = content.text.match(/\n\n(\[[^\n]*\])$/)?.[1];
+				const indexed = compactGrepRecords(
+					run.records,
 					fullOutputPath,
-					maxBytes,
+					params.maxBytes ?? DEFAULT_OPTIMIZED_BYTES,
 					params.maxPerFile ?? DEFAULT_GREP_MAX_PER_FILE,
-					{
-						pattern: params.pattern,
-						literal: params.literal,
-						ignoreCase: params.ignoreCase,
-					},
+					notice ? [notice] : [],
 				);
 				await writeFile(fullOutputPath, content.text, "utf8");
 				return {
 					content: [{ type: "text" as const, text: indexed.text }],
-					details: exact.details as GrepToolDetails | undefined,
+					details: run.exact.details,
 				};
-			} catch {
+			} catch (error) {
 				if (outputDir) await rm(outputDir, { recursive: true, force: true }).catch(() => {});
-				// Optimization failure must never make a successful exact grep fail.
-				return exact;
+				// Artifact/index failures cannot invalidate an otherwise exact search result.
+				return run.exact;
 			}
 		},
 	});
