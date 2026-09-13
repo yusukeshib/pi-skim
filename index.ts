@@ -668,12 +668,20 @@ async function optimizedRead(
 	if (action === "symbol") {
 		if (!params.symbol) throw new Error("`symbol` is required for read action=symbol");
 		const symbols = await symbolsFor(absolutePath, signal);
-		const candidateSignature = params.symbol.includes(": ")
+		const prefixedCandidateSignature = params.symbol.includes(": ")
 			? params.symbol.slice(params.symbol.indexOf(": ") + 2)
-			: params.symbol;
-		const signature = symbols.some((symbol) => symbol.signature === candidateSignature)
-			? candidateSignature
-			: explicitSignature(params.symbol);
+			: undefined;
+		let signature = symbols.some((symbol) => symbol.signature === params.symbol)
+			? params.symbol
+			: undefined;
+		if (
+			!signature &&
+			prefixedCandidateSignature &&
+			symbols.some((symbol) => symbol.signature === prefixedCandidateSignature)
+		) {
+			signature = prefixedCandidateSignature;
+		}
+		signature ??= explicitSignature(params.symbol);
 		const selector = splitSymbolSelector(params.symbol);
 		let hits = signature
 			? symbols.filter((symbol) => symbol.signature === signature)

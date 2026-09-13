@@ -377,14 +377,14 @@ test("outline stays bounded when even the complete symbol index exceeds the budg
 	}
 });
 
-test("Makefile multi-target rules expose every target and round-trip candidate signatures", async () => {
+test("Makefile multi-target rules expose every target and round-trip emitted signatures", async () => {
 	const dir = tempDir();
 	try {
 		writeFileSync(
 			path.join(dir, "Makefile"),
 			"alpha beta: dependency\n\t@echo built\n\ndependency:\n\t@echo dependency\n",
 		);
-		for (const symbol of ["alpha", "beta", "alpha: alpha beta: dependency"]) {
+		for (const symbol of ["alpha", "beta", "alpha beta: dependency", "alpha: alpha beta: dependency"]) {
 			const result = await executeRead(dir, { path: "Makefile", action: "symbol", symbol });
 			expect(result.content[0].text).toContain("@echo built");
 			expect(result.content[0].text).not.toContain("@echo dependency");
