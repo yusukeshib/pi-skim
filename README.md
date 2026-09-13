@@ -129,7 +129,7 @@ Read nudges:
 
 Explicit and open-ended ranges are never nudged. Every whole-file nudge is keyed by the exact request and fires once per session. Repeating the same call runs unchanged. Grep does not use a blocking nudge: it executes once and indexes only when the exact result exceeds 8KB.
 
-Exact grep and detailed-outline artifacts are retained for seven days so resumed sessions can follow their links. Cleanup is best-effort on session start and never affects tool execution.
+Exact grep and detailed-outline artifacts are stored in a private per-user state directory and retained for seven days so resumed sessions and later processes can follow their links. Retention is bounded by both age and total bytes; capacity cleanup removes the oldest recognized pi-skim artifacts first. Cleanup is best-effort, ignores unrelated and symlink entries, and never turns a successful exact tool call into a failure.
 
 Environment variables:
 
@@ -137,7 +137,9 @@ Environment variables:
 |---|---|
 | `PI_SKIM_NUDGE=0` | Disable read nudges |
 | `PI_SKIM_NUDGE_BYTES` | Whole-source threshold |
+| `PI_SKIM_ARTIFACT_DIR` | Artifact root (default: absolute `$XDG_STATE_HOME/pi-skim/artifacts`, or `~/.local/state/pi-skim/artifacts`) |
 | `PI_SKIM_ARTIFACT_TTL_MS` | Exact grep and detailed-outline artifact retention (default: 7 days) |
+| `PI_SKIM_ARTIFACT_MAX_BYTES` | Maximum retained artifact bytes; oldest artifacts are removed first (default: 100 MiB) |
 
 ## Install
 
@@ -161,4 +163,4 @@ npm install
 npm run check
 ```
 
-The test suite verifies exact built-in read/grep parity, one-time read bypass behavior, AST navigation (including Swift), bounded grep indexing and manifest overflow, byte-for-byte exact-result preservation, stale artifact cleanup, and that pi-babysit calls are untouched.
+The test suite verifies exact built-in read/grep parity, one-time read bypass behavior, AST navigation (including Swift), bounded grep indexing and manifest overflow, byte-for-byte exact-result preservation, private durable artifact storage, TTL/capacity cleanup and failure fallback, and that pi-babysit calls are untouched.

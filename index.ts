@@ -1,7 +1,19 @@
 import { execFile } from "node:child_process";
 import { accessSync, constants } from "node:fs";
-import { mkdtemp, open, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import {
+	chmod,
+	lstat,
+	mkdir,
+	mkdtemp,
+	open,
+	readFile,
+	readdir,
+	rename,
+	rm,
+	stat,
+	writeFile,
+} from "node:fs/promises";
+import { homedir } from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -53,8 +65,27 @@ const MAX_OPTIMIZED_BYTES = 32_000;
 const MAX_SOURCE_BYTES = 64 * 1024 * 1024;
 const READ_NUDGE_BYTES = Number(process.env.PI_SKIM_NUDGE_BYTES) || 20_000;
 const DEFAULT_GREP_MAX_PER_FILE = 3;
-const ARTIFACT_TTL_MS = Number(process.env.PI_SKIM_ARTIFACT_TTL_MS) || 7 * 24 * 60 * 60 * 1_000;
-const ARTIFACT_PREFIXES = ["pi-skim-grep-", "pi-skim-outline-"];
+const DEFAULT_ARTIFACT_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
+const DEFAULT_ARTIFACT_MAX_BYTES = 100 * 1024 * 1024;
+const ARTIFACT_MARKER = ".pi-skim-artifact-v1";
+const ARTIFACT_NAME = /^pi-skim-(?:grep|outline)-[A-Za-z0-9]+$/;
+
+function nonNegativeSetting(value: string | undefined, fallback: number): number {
+	if (value === undefined || value.trim() === "") return fallback;
+	const parsed = Number(value);
+	return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : fallback;
+}
+
+export function resolveArtifactRoot(
+	env: NodeJS.ProcessEnv = process.env,
+	home = homedir(),
+): string {
+	if (env.PI_SKIM_ARTIFACT_DIR) return path.resolve(env.PI_SKIM_ARTIFACT_DIR);
+	if (env.XDG_STATE_HOME && path.isAbsolute(env.XDG_STATE_HOME)) {
+		return path.join(env.XDG_STATE_HOME, "pi-skim", "artifacts");
+	}
+	return path.join(home, ".local", "state", "pi-skim", "artifacts");
+}
 
 export function resolveOptimizedPath(cwd: string, input: string): string {
 	let normalized = input.replace(/[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g, " ");
@@ -458,33 +489,126 @@ export async function symbolsFor(filePath: string, signal?: AbortSignal): Promis
 		: astGrepSymbols(filePath, detected.config, signal, detected.scanFromStdin);
 }
 
-export async function cleanupStaleArtifacts(
-	rootDir = tmpdir(),
-	now = Date.now(),
-	ttlMs = ARTIFACT_TTL_MS,
-): Promise<void> {
-	let entries;
-	try {
-		entries = await readdir(rootDir, { withFileTypes: true });
-	} catch {
-		return;
+interface ArtifactInfo {
+	path: string;
+	mtimeMs: number;
+	bytes: number;
+}
+
+async function artifactInfo(rootDir: string, name: string): Promise<ArtifactInfo | undefined> {
+	if (!ARTIFACT_NAME.test(name)) return undefined;
+	const artifactPath = path.join(rootDir, name);
+	const directory = await lstat(artifactPath);
+	if (!directory.isDirectory() || directory.isSymbolicLink()) return undefined;
+
+	const markerPath = path.join(artifactPath, ARTIFACT_MARKER);
+	const marker = await lstat(markerPath);
+	if (!marker.isFile() || marker.isSymbolicLink() || (await readFile(markerPath, "utf8")) !== "pi-skim\n") {
+		return undefined;
 	}
-	await Promise.all(
-		entries
-			.filter(
-				(entry) => entry.isDirectory() && ARTIFACT_PREFIXES.some((prefix) => entry.name.startsWith(prefix)),
-			)
-			.map(async (entry) => {
-				const artifactDir = path.join(rootDir, entry.name);
-				try {
-					if (now - (await stat(artifactDir)).mtimeMs > ttlMs) {
-						await rm(artifactDir, { recursive: true, force: true });
-					}
-				} catch {
-					// Cleanup is best-effort and must never affect tool execution.
-				}
-			}),
-	);
+
+	let bytes = 0;
+	for (const entry of await readdir(artifactPath, { withFileTypes: true })) {
+		const entryPath = path.join(artifactPath, entry.name);
+		const info = await lstat(entryPath);
+		// Produced artifacts are flat and contain only regular files. Treat anything
+		// else as unrelated/tampered state and leave the whole directory alone.
+		if (!info.isFile() || info.isSymbolicLink()) return undefined;
+		bytes += info.size;
+	}
+	return { path: artifactPath, mtimeMs: directory.mtimeMs, bytes };
+}
+
+export async function cleanupStaleArtifacts(
+	rootDir = resolveArtifactRoot(),
+	now = Date.now(),
+	ttlMs = nonNegativeSetting(process.env.PI_SKIM_ARTIFACT_TTL_MS, DEFAULT_ARTIFACT_TTL_MS),
+	maxBytes = nonNegativeSetting(process.env.PI_SKIM_ARTIFACT_MAX_BYTES, DEFAULT_ARTIFACT_MAX_BYTES),
+	protectedPath?: string,
+): Promise<void> {
+	try {
+		const root = await lstat(rootDir);
+		if (!root.isDirectory() || root.isSymbolicLink()) return;
+		const entries = await readdir(rootDir, { withFileTypes: true });
+		const artifacts: ArtifactInfo[] = [];
+		for (const entry of entries) {
+			if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+			try {
+				const info = await artifactInfo(rootDir, entry.name);
+				if (info) artifacts.push(info);
+			} catch {
+				// A raced, inaccessible, or malformed entry is not safe to remove.
+			}
+		}
+
+		artifacts.sort((left, right) => left.mtimeMs - right.mtimeMs || left.path.localeCompare(right.path));
+		let totalBytes = artifacts.reduce((sum, artifact) => sum + artifact.bytes, 0);
+		for (const artifact of artifacts) {
+			const expired = now - artifact.mtimeMs > ttlMs;
+			const overCapacity = totalBytes > maxBytes;
+			if ((!expired && !overCapacity) || artifact.path === protectedPath) continue;
+			try {
+				const current = await artifactInfo(rootDir, path.basename(artifact.path));
+				if (!current) continue;
+				await rm(artifact.path, { recursive: true, force: true });
+				totalBytes -= artifact.bytes;
+			} catch {
+				// Cleanup is best-effort and must never affect tool execution.
+			}
+		}
+	} catch {
+		// Missing/inaccessible roots and cleanup failures are harmless.
+	}
+}
+
+async function createArtifact(
+	kind: "grep" | "outline",
+	files: Record<string, string>,
+	signal?: AbortSignal,
+): Promise<string> {
+	const rootDir = resolveArtifactRoot();
+	let temporaryPath: string | undefined;
+	let publishedPath: string | undefined;
+	try {
+		await mkdir(rootDir, { recursive: true, mode: 0o700 });
+		const root = await lstat(rootDir);
+		if (!root.isDirectory() || root.isSymbolicLink()) throw new Error("Artifact root is not a directory");
+		await chmod(rootDir, 0o700);
+
+		temporaryPath = await mkdtemp(path.join(rootDir, `.pi-skim-${kind}-`));
+		await chmod(temporaryPath, 0o700);
+		const suffix = path.basename(temporaryPath).slice(`.pi-skim-${kind}-`.length);
+		publishedPath = path.join(rootDir, `pi-skim-${kind}-${suffix}`);
+		for (const [name, content] of Object.entries(files)) {
+			await writeFile(path.join(temporaryPath, name), content, {
+				encoding: "utf8",
+				mode: 0o600,
+				signal,
+			});
+		}
+		await writeFile(path.join(temporaryPath, ARTIFACT_MARKER), "pi-skim\n", {
+			encoding: "utf8",
+			mode: 0o600,
+			signal,
+		});
+		if (signal?.aborted) throw signal.reason ?? new Error("Artifact creation aborted");
+		await rename(temporaryPath, publishedPath);
+		temporaryPath = undefined;
+		await cleanupStaleArtifacts(rootDir, Date.now(), undefined, undefined, publishedPath);
+		const current = await artifactInfo(rootDir, path.basename(publishedPath));
+		const maxBytes = nonNegativeSetting(
+			process.env.PI_SKIM_ARTIFACT_MAX_BYTES,
+			DEFAULT_ARTIFACT_MAX_BYTES,
+		);
+		if (!current || current.bytes > maxBytes || signal?.aborted) {
+			throw signal?.reason ?? new Error("Artifact exceeds retention capacity");
+		}
+		return publishedPath;
+	} catch (error) {
+		if (temporaryPath) await rm(temporaryPath, { recursive: true, force: true }).catch(() => {});
+		if (publishedPath) await rm(publishedPath, { recursive: true, force: true }).catch(() => {});
+		throw error;
+	}
 }
 
 function boundedText(body: string, maxBytes: number, continuation: string): BoundedText {
@@ -615,9 +739,6 @@ async function optimizedRead(
 
 		let outputDir: string | undefined;
 		try {
-			outputDir = await mkdtemp(path.join(tmpdir(), "pi-skim-outline-"));
-			const detailedPath = path.join(outputDir, "detailed-outline.txt");
-			const symbolIndexPath = path.join(outputDir, "symbol-index.txt");
 			const symbolIndex =
 				`Symbol index: ${params.path} (${symbols.length} symbols)\n` +
 				symbols
@@ -626,14 +747,17 @@ async function optimizedRead(
 							`${"  ".repeat(symbol.depth)}${symbol.name}  [${symbol.start}-${symbol.end}]`,
 					)
 					.join("\n");
+			outputDir = await createArtifact(
+				"outline",
+				{ "detailed-outline.txt": detailed, "symbol-index.txt": symbolIndex },
+				signal,
+			);
+			const detailedPath = path.join(outputDir, "detailed-outline.txt");
+			const symbolIndexPath = path.join(outputDir, "symbol-index.txt");
 			const footer =
 				`[Full symbol index: ${symbolIndexPath}]\n` +
 				`[Detailed signatures: ${detailedPath}]\n` +
 				"[Use read action=symbol or exact line ranges for source.]";
-			await Promise.all([
-				writeFile(detailedPath, detailed, "utf8"),
-				writeFile(symbolIndexPath, symbolIndex, "utf8"),
-			]);
 			const compact = `${symbolIndex}\n${footer}`;
 			if (byteLength(compact) <= maxBytes) {
 				return {
@@ -1042,7 +1166,11 @@ export default function extension(pi: ExtensionAPI): void {
 			if (byteLength(content.text) <= DEFAULT_OPTIMIZED_BYTES) return exact;
 			let outputDir: string | undefined;
 			try {
-				outputDir = await mkdtemp(path.join(tmpdir(), "pi-skim-grep-"));
+				outputDir = await createArtifact(
+					"grep",
+					{ "exact-output.txt": content.text },
+					signal,
+				);
 				const fullOutputPath = path.join(outputDir, "exact-output.txt");
 				const indexed = compactGrepOutput(
 					content.text,
@@ -1055,7 +1183,6 @@ export default function extension(pi: ExtensionAPI): void {
 						ignoreCase: params.ignoreCase,
 					},
 				);
-				await writeFile(fullOutputPath, content.text, "utf8");
 				return {
 					content: [{ type: "text" as const, text: indexed.text }],
 					details: exact.details as GrepToolDetails | undefined,
