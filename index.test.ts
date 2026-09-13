@@ -1,10 +1,26 @@
-import { expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { afterAll, expect, test } from "bun:test";
+import {
+	existsSync,
+	lstatSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	readdirSync,
+	rmSync,
+	symlinkSync,
+	utimesSync,
+	writeFileSync,
+} from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { createGrepToolDefinition, createReadToolDefinition } from "@earendil-works/pi-coding-agent";
-import extension, { cleanupStaleArtifacts, compactGrepOutput, resolveOptimizedPath } from "./index.ts";
+import extension, {
+	cleanupStaleArtifacts,
+	compactGrepOutput,
+	resolveArtifactRoot,
+	resolveOptimizedPath,
+} from "./index.ts";
 
 const tools = new Map<string, any>();
 const hooks = new Map<string, any>();
@@ -26,6 +42,23 @@ extension({
 
 function tempDir(): string {
 	return mkdtempSync(path.join(tmpdir(), "pi-skim-test-"));
+}
+
+const previousArtifactRoot = process.env.PI_SKIM_ARTIFACT_DIR;
+const artifactState = tempDir();
+process.env.PI_SKIM_ARTIFACT_DIR = path.join(artifactState, "artifacts");
+afterAll(() => {
+	if (previousArtifactRoot === undefined) delete process.env.PI_SKIM_ARTIFACT_DIR;
+	else process.env.PI_SKIM_ARTIFACT_DIR = previousArtifactRoot;
+	rmSync(artifactState, { recursive: true, force: true });
+});
+
+function createRecognizedArtifact(root: string, name: string, content: string): string {
+	const artifact = path.join(root, name);
+	mkdirSync(artifact, { recursive: true });
+	writeFileSync(path.join(artifact, ".pi-skim-artifact-v1"), "pi-skim\n");
+	writeFileSync(path.join(artifact, "exact-output.txt"), content);
+	return artifact;
 }
 
 function ctx(cwd: string) {
@@ -740,11 +773,7 @@ test("oversized grep becomes a bounded cross-file index with exact output preser
 		exactPath = smart.content[0].text.match(/\[Full exact grep result: (.+)\]/)?.[1];
 		expect(exactPath).toBeTruthy();
 		const savedExact = await Bun.file(exactPath!).text();
-		expect(Buffer.byteLength(savedExact)).toBeGreaterThan(2_000);
-		expect(savedExact).toContain("a.ts:1: needle");
-		expect(savedExact.split("\n").filter((line) => /:\d+:/.test(line)).length).toBe(
-			exactContent.text.split("\n").filter((line) => /:\d+:/.test(line)).length,
-		);
+		expect(savedExact).toBe(exactContent.text);
 		const exactMode = await executeGrep(dir, { ...input, mode: "exact" });
 		const exactModeContent = exactMode.content[0];
 		if (exactModeContent?.type !== "text") throw new Error("Expected exact text grep output");
@@ -828,22 +857,131 @@ test("manifest overflow remains bounded when the exact-result path is too long",
 	expect(result.text).toContain("exact-result path exceeds");
 });
 
-test("stale artifacts are removed without touching fresh or unrelated directories", async () => {
-	const root = tempDir();
+test("artifact root resolution honors override, absolute XDG state, and home fallback", () => {
+	expect(resolveArtifactRoot({ PI_SKIM_ARTIFACT_DIR: "relative-artifacts" }, "/home/test")).toBe(
+		path.resolve("relative-artifacts"),
+	);
+	expect(resolveArtifactRoot({ XDG_STATE_HOME: "/state" }, "/home/test")).toBe(
+		path.join("/state", "pi-skim", "artifacts"),
+	);
+	expect(resolveArtifactRoot({ XDG_STATE_HOME: "relative-state" }, "/home/test")).toBe(
+		path.join("/home/test", ".local", "state", "pi-skim", "artifacts"),
+	);
+	expect(resolveArtifactRoot({}, "/home/test")).toBe(
+		path.join("/home/test", ".local", "state", "pi-skim", "artifacts"),
+	);
+});
+
+test("published artifacts and files are private where permission bits are supported", async () => {
+	if (process.platform === "win32") return;
+	const dir = tempDir();
+	let exactPath: string | undefined;
 	try {
-		const stale = path.join(root, "pi-skim-grep-stale");
-		const fresh = path.join(root, "pi-skim-outline-fresh");
+		writeFileSync(
+			path.join(dir, "large.txt"),
+			Array.from({ length: 100 }, (_, index) => `needle ${index} ${"x".repeat(200)}`).join("\n"),
+		);
+		const result = await executeGrep(dir, { pattern: "needle", path: "large.txt" });
+		exactPath = result.content[0].text.match(/\[Full exact grep result: (.+)\]/)?.[1];
+		expect(exactPath).toBeTruthy();
+		expect(lstatSync(process.env.PI_SKIM_ARTIFACT_DIR!).mode & 0o777).toBe(0o700);
+		expect(lstatSync(path.dirname(exactPath!)).mode & 0o777).toBe(0o700);
+		expect(lstatSync(exactPath!).mode & 0o777).toBe(0o600);
+	} finally {
+		if (exactPath) rmSync(path.dirname(exactPath), { recursive: true, force: true });
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("stale artifacts are removed without touching fresh, unrelated, or symlink entries", async () => {
+	const root = tempDir();
+	const symlinkTarget = tempDir();
+	try {
+		const stale = createRecognizedArtifact(root, "pi-skim-grep-stale", "stale");
+		const fresh = createRecognizedArtifact(root, "pi-skim-outline-fresh", "fresh");
+		const unmarked = path.join(root, "pi-skim-grep-unmarked");
 		const unrelated = path.join(root, "other-tool-stale");
-		for (const dir of [stale, fresh, unrelated]) mkdirSync(dir);
+		mkdirSync(unmarked);
+		mkdirSync(unrelated);
+		writeFileSync(path.join(symlinkTarget, "keep.txt"), "keep");
+		const linked = path.join(root, "pi-skim-grep-linked");
+		symlinkSync(symlinkTarget, linked, "dir");
 		const now = Date.now();
-		utimesSync(stale, (now - 20_000) / 1_000, (now - 20_000) / 1_000);
-		utimesSync(unrelated, (now - 20_000) / 1_000, (now - 20_000) / 1_000);
+		for (const entry of [stale, unmarked, unrelated]) {
+			utimesSync(entry, (now - 20_000) / 1_000, (now - 20_000) / 1_000);
+		}
 		await cleanupStaleArtifacts(root, now, 10_000);
 		expect(existsSync(stale)).toBe(false);
 		expect(existsSync(fresh)).toBe(true);
+		expect(existsSync(unmarked)).toBe(true);
 		expect(existsSync(unrelated)).toBe(true);
+		expect(lstatSync(linked).isSymbolicLink()).toBe(true);
+		expect(readFileSync(path.join(symlinkTarget, "keep.txt"), "utf8")).toBe("keep");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
+		rmSync(symlinkTarget, { recursive: true, force: true });
+	}
+});
+
+test("capacity cleanup evicts oldest recognized artifacts first", async () => {
+	const root = tempDir();
+	try {
+		const oldest = createRecognizedArtifact(root, "pi-skim-grep-oldest", "a".repeat(100));
+		const middle = createRecognizedArtifact(root, "pi-skim-grep-middle", "b".repeat(100));
+		const newest = createRecognizedArtifact(root, "pi-skim-outline-newest", "c".repeat(100));
+		const now = Date.now();
+		utimesSync(oldest, (now - 3_000) / 1_000, (now - 3_000) / 1_000);
+		utimesSync(middle, (now - 2_000) / 1_000, (now - 2_000) / 1_000);
+		utimesSync(newest, (now - 1_000) / 1_000, (now - 1_000) / 1_000);
+		const oneArtifactBytes = 100 + Buffer.byteLength("pi-skim\n");
+		await cleanupStaleArtifacts(root, now, 60_000, oneArtifactBytes * 2);
+		expect(existsSync(oldest)).toBe(false);
+		expect(existsSync(middle)).toBe(true);
+		expect(existsSync(newest)).toBe(true);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("artifact failures return exact grep output and leave no partial linked artifact", async () => {
+	const dir = tempDir();
+	const invalidRoot = path.join(dir, "not-a-directory");
+	writeFileSync(invalidRoot, "blocked");
+	writeFileSync(
+		path.join(dir, "large.txt"),
+		Array.from({ length: 100 }, (_, index) => `needle ${index} ${"x".repeat(200)}`).join("\n"),
+	);
+	const previous = process.env.PI_SKIM_ARTIFACT_DIR;
+	try {
+		process.env.PI_SKIM_ARTIFACT_DIR = invalidRoot;
+		const input = { pattern: "needle", path: "large.txt" };
+		expect(await executeGrep(dir, input)).toEqual(await executeBuiltInGrep(dir, input));
+		expect(readFileSync(invalidRoot, "utf8")).toBe("blocked");
+	} finally {
+		process.env.PI_SKIM_ARTIFACT_DIR = previous;
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("an artifact larger than the configured ceiling falls back exactly and is removed", async () => {
+	const dir = tempDir();
+	writeFileSync(
+		path.join(dir, "large.txt"),
+		Array.from({ length: 100 }, (_, index) => `needle ${index} ${"x".repeat(200)}`).join("\n"),
+	);
+	const previous = process.env.PI_SKIM_ARTIFACT_MAX_BYTES;
+	try {
+		process.env.PI_SKIM_ARTIFACT_MAX_BYTES = "1";
+		const input = { pattern: "needle", path: "large.txt" };
+		expect(await executeGrep(dir, input)).toEqual(await executeBuiltInGrep(dir, input));
+		const entries = existsSync(process.env.PI_SKIM_ARTIFACT_DIR!)
+			? readdirSync(process.env.PI_SKIM_ARTIFACT_DIR!)
+			: [];
+		expect(entries.filter((name) => /^pi-skim-grep-/.test(name))).toEqual([]);
+	} finally {
+		if (previous === undefined) delete process.env.PI_SKIM_ARTIFACT_MAX_BYTES;
+		else process.env.PI_SKIM_ARTIFACT_MAX_BYTES = previous;
+		rmSync(dir, { recursive: true, force: true });
 	}
 });
 
