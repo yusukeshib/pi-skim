@@ -10,7 +10,7 @@ The extension never automatically summarizes or deletes an executed exact result
 
 - `read` with no `action`, or with `action=exact`, delegates unchanged to pi's built-in read implementation.
 - Large whole-source reads receive a **one-time nudge** toward an outline/symbol. Explicit ranges always remain exact. Repeating the whole-file call bypasses the nudge.
-- Grep results up to 8KB delegate unchanged to pi's built-in grep. Larger results become a bounded file index with the byte-for-byte exact result saved and linked. If every file path cannot fit, the bounded response links the exact result instead of failing open to a large payload.
+- Smart/default grep runs ripgrep once in JSON mode. That event stream produces both pi-compatible exact text and structured match records: results up to 8KB remain exact, while larger results become a bounded file index with the byte-for-byte exact result saved and linked. No rendered `path:line` text is reparsed and no second search is run. If every escaped file path cannot fit, the bounded response links the exact result instead of failing open to a large payload.
 - `mode=exact` bypasses indexing and is intended only for explicit exhaustive requests or after a smart result proves insufficient.
 - Optimized output always honors its explicit byte budget and points to exact fallback when truncated.
 - Unsupported AST languages fail clearly; exact read remains available.
@@ -35,7 +35,7 @@ After removing the old `pi-ast-read` package, its two schemas are replaced by th
 
 | Call | Behavior |
 |---|---|
-| `grep({ pattern, ... })` | Exact built-in result when ≤8KB; otherwise bounded file index plus exact-output path |
+| `grep({ pattern, ... })` | Pi-compatible exact result from one structured ripgrep run when ≤8KB; otherwise bounded structured file index plus exact-output path |
 | `grep({ pattern, mode: "exact", ... })` | Exact pi built-in grep result for an explicitly exhaustive request |
 | `grep({ pattern, maxBytes, maxPerFile, ... })` | Configure smart-index budget and representative matches; activation remains fixed at 8KB. If the file manifest cannot fit, returns a bounded exact-result link |
 
@@ -163,4 +163,4 @@ npm install
 npm run check
 ```
 
-The test suite verifies exact built-in read/grep parity, one-time read bypass behavior, AST navigation (including Swift), bounded grep indexing and manifest overflow, byte-for-byte exact-result preservation, private durable artifact storage, TTL/capacity cleanup and failure fallback, and that pi-babysit calls are untouched.
+The test suite verifies exact built-in read behavior, differential smart-grep parity across path/glob/literal/case/context/limit/long-line semantics, one-ripgrep execution, adversarial filenames and content, exact-mode delegation, one-time read bypass behavior, AST navigation (including Swift), bounded grep indexing and manifest overflow, byte-for-byte exact-result preservation, cancellation, private durable artifact storage, TTL/capacity cleanup and failure fallback, and that pi-babysit calls are untouched.
