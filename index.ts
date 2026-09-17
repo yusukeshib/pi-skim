@@ -327,6 +327,10 @@ function symbolName(declaration: string): string {
 	if (swiftFunction) return swiftFunction;
 	const swiftProperty = withoutAttributes.match(/\b(?:var|let)\s+([A-Za-z_]\w*)/)?.[1];
 	if (swiftProperty) return swiftProperty;
+	const namedDeclaration = withoutAttributes.match(
+		/\b(?:function|def|fn|class|struct|enum|trait|interface|type|mod)\s+([A-Za-z_]\w*)/,
+	)?.[1];
+	if (namedDeclaration) return namedDeclaration;
 	const normalized = withoutAttributes.replace(/<[^>]*>/g, " ");
 	if (/^\s*(pub\s+)?(unsafe\s+)?impl\b/.test(normalized)) {
 		const forMatch = normalized.match(/\bfor\s+([A-Za-z_][\w:]*)/)?.[1];
@@ -697,7 +701,7 @@ function splitSymbolSelector(selector: string): { target: string; parent?: strin
 
 function explicitSignature(selector: string): string | undefined {
 	const candidate = selector.includes(": ") ? selector.slice(selector.indexOf(": ") + 2) : selector;
-	return /^(?:pub\s+)?(?:impl|struct|enum|trait|fn|type|const|static|class|interface|protocol|actor|extension|func|var|let)\b/.test(
+	return /^(?:pub\s+)?(?:impl|struct|enum|trait|fn|type|const|static|class|interface|protocol|actor|extension|func|var|let)\s+\S/.test(
 		candidate,
 	)
 		? candidate
